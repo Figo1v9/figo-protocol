@@ -121,8 +121,8 @@ func main() {
 		}
 		targetAddr := string(bytes.TrimSpace(targetAddrBytes))
 
-		// Dial target host
-		targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+		// Dial target host over IPv4
+		targetConn, err := net.DialTimeout("tcp4", targetAddr, 10*time.Second)
 		if err != nil {
 			logger.Error("failed to dial target host", "host", targetAddr, "error", err)
 			return

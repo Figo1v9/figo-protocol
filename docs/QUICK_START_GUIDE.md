@@ -4,6 +4,20 @@
 
 ---
 
+## ⚡ الـ Master Cheat Sheet (أمر سطر واحد لكل VPS جديد)
+
+### 1️⃣ أمر السيرفر على Google Cloud VPS SSH (بعد رفع `fgxp-server-linux`):
+```bash
+chmod +x fgxp-server-linux && sudo pkill -f fgxp-server ; sudo nohup ./fgxp-server-linux --listen 0.0.0.0:80 --no-tls --psk "my-secure-shared-key-32bytes" > server.log 2>&1 &
+```
+
+### 2️⃣ أمر العميل على جهازك المحلّي (Windows PowerShell):
+```powershell
+.\bin\fgxp-client.exe --server NEW_VPS_IP:80 --psk "my-secure-shared-key-32bytes" --sni "http://digital.gov.eg/" --socks-listen 127.0.0.1:1081
+```
+
+---
+
 ## 🖥️ القسم الأول: الخطوات على خادم الـ VPS (عبر الـ SSH)
 
 ### 1️⃣ الخطوة الأولى: تجهيز وبناء الملف على جهازك ثم رفعه للـ VPS
