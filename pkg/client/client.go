@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net/url"
 	"sync"
 	"time"
 
@@ -177,13 +178,23 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	switch {
 	case c.opts.WSURL != "":
-		// WebSocket relay through Cloudflare Worker: bypasses ISP IP-based filtering
-		c.logger.Info("WebSocket relay mode", "url", c.opts.WSURL, "inject_host", c.opts.InjectHost)
-		conn, err := transport.DialWebSocket(ctx, c.opts.WSURL, c.opts.InjectHost)
+		// WebSocket relay through Cloudflare Worker with CDN Fronting:
+		// SNI = Free host for ISP DPI bypass (e.g. digital.gov.eg)
+		// Host Header = Worker domain for Cloudflare internal routing (e.g. my-vpn-relay.workers.dev)
+		hostHeader := ""
+		if parsedURL, err := url.Parse(c.opts.WSURL); err == nil {
+			hostHeader = parsedURL.Host
+		}
+		c.logger.Info("WebSocket relay mode with CDN Fronting", "url", c.opts.WSURL, "sni", sniHost, "host_header", hostHeader)
+		conn, err := transport.DialWebSocket(ctx, transport.DialWebSocketOptions{
+			WSURL:      c.opts.WSURL,
+			SNI:        sniHost,
+			HostHeader: hostHeader,
+		})
 		if err != nil {
 			return fmt.Errorf("websocket relay failed: %w", err)
 		}
-		c.logger.Info("WebSocket relay connected")
+		c.logger.Info("WebSocket relay connected successfully")
 		c.conn = conn
 	case c.opts.InjectHost != "":
 		// HTTP Injection Engine: tunnel through ISP transparent proxy

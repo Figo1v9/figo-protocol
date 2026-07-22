@@ -242,3 +242,13 @@ sudo systemctl status fgxp
 الحل النهائي لهذه النقطة في الإنتاج: تثبيت شهادة Let's Encrypt مجانية ورسمية على الـ VPS لدومين خاص بك، أو تشغيل النفق خلف Cloudflare Tunnel (CDN Reverse Proxy)، وبكده تكون طفّيت آخر نقطة ضعف بنسبة 99.9%!
 📌 الخلاصة والقول الواحد:
 البروتوكول بتاعنا figox-protocol حالياً من أقوى الهياكل البرمجية المعتمدة على معايير uTLS + L7 Framing + Active Camouflage + Entropy Padding. تقدر تعتمد عليه وأنت مطمئن تماماً!
+
+
+
+
+
+
+
+
+
+.\bin\fgxp-client.exe --server "34.139.64.35:80" --psk "my-secure-shared-key-32bytes" --ws "wss://my-vpn-relay.mohamedkhedr974.workers.dev" --inject "digital.gov.eg" --socks-listen 127.0.0.1:1081

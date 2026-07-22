@@ -105,19 +105,18 @@ func (c *wsConn) TransportType() Type {
 	return TCP
 }
 
-// DialWebSocket connects to a WebSocket endpoint (typically a Cloudflare Worker)
-// and returns a transport.Conn that wraps the WebSocket in a stream interface.
-// If injectHost is provided, it sets the Host header to bypass ISP filters (Fronting).
-func DialWebSocket(ctx context.Context, wsURL string, injectHost string) (Conn, error) {
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-	}
+// DialWebSocketOptions configures the WebSocket transport with CDN Fronting support.
+type DialWebSocketOptions struct {
+	WSURL      string // Worker URL (e.g. wss://my-vpn-relay.mohamedkhedr974.workers.dev)
+	SNI        string // TLS SNI for handshake spoofing (e.g. digital.gov.eg)
+	HostHeader string // HTTP Host header for Cloudflare routing (e.g. my-vpn-relay.mohamedkhedr974.workers.dev)
+	DialAddr   string // Optional target IP override to dial (e.g. Cloudflare IP 104.16.53.111)
+}
 
-	// Build the WebSocket URL
-	u, err := url.Parse(wsURL)
+// DialWebSocket connects to a WebSocket endpoint (typically a Cloudflare Worker)
+// supporting full CDN Fronting (SNI spoofing + Worker routing).
+func DialWebSocket(ctx context.Context, opts DialWebSocketOptions) (Conn, error) {
+	u, err := url.Parse(opts.WSURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse ws url: %w", err)
 	}
@@ -130,11 +129,37 @@ func DialWebSocket(ctx context.Context, wsURL string, injectHost string) (Conn, 
 		u.Scheme = "wss"
 	}
 
-	headers := http.Header{
-		"User-Agent": {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
+	// Default Host header to the URL host if not specified
+	hostHeader := opts.HostHeader
+	if hostHeader == "" {
+		hostHeader = u.Host
 	}
-	if injectHost != "" {
-		headers.Set("Host", injectHost)
+
+	// Default SNI to HostHeader or URL host if not specified
+	sniHost := opts.SNI
+	if sniHost == "" {
+		sniHost = u.Hostname()
+	}
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		TLSClientConfig: &tls.Config{
+			ServerName:         sniHost,
+			InsecureSkipVerify: true,
+		},
+	}
+
+	// Override NetDialContext if custom DialAddr or SNI is specified
+	if opts.DialAddr != "" {
+		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			netDialer := &net.Dialer{Timeout: 15 * time.Second}
+			return netDialer.DialContext(ctx, network, opts.DialAddr)
+		}
+	}
+
+	headers := http.Header{
+		"Host":       {hostHeader},
+		"User-Agent": {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
 	}
 
 	ws, _, err := dialer.DialContext(ctx, u.String(), headers)
