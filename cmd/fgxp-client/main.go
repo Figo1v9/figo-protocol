@@ -28,6 +28,7 @@ func main() {
 	realIP := flag.String("real-ip", "", "Optional target IP for Domain Fronting and CDN routing")
 	injectHost := flag.String("inject", "", "Whitelisted host for HTTP Injection bypass (e.g. digital.gov.eg)")
 	injectMethod := flag.String("inject-method", "connect", "Injection method: connect, front, keepalive")
+	wsURL := flag.String("ws", "", "Cloudflare Worker WebSocket relay URL (e.g. wss://my-relay.workers.dev)")
 	transportType := flag.String("transport", "tcp", "Transport: tcp or quic")
 	socksListen := flag.String("socks-listen", "127.0.0.1:1080", "SOCKS5 proxy listen address (host:port)")
 	logLevel := flag.String("log-level", "info", "Log level")
@@ -77,6 +78,7 @@ func main() {
 		RealIP:        *realIP,
 		InjectHost:    *injectHost,
 		InjectMethod:  *injectMethod,
+		WSURL:         *wsURL,
 		TransportType: transType,
 		PSK:           []byte(*psk),
 		SNI:           *sni,

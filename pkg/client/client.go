@@ -32,6 +32,7 @@ type ClientOptions struct {
 	RealIP        string // Optional target IP override for Domain Fronting and CDN routing
 	InjectHost    string // Whitelisted host for HTTP Injection bypass (e.g. "digital.gov.eg")
 	InjectMethod  string // Injection method: "connect", "front", "keepalive" (default: "connect")
+	WSURL         string // Cloudflare Worker WebSocket relay URL (e.g. wss://my-relay.workers.dev)
 	Config        *config.ClientConfig
 	TLSConfig     *tls.Config
 
@@ -175,6 +176,15 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.logger.Info("connecting to FGXP server", "addr", dialAddr, "transport", c.opts.TransportType.String(), "fingerprint", c.fingerprint(), "sni", sniHost)
 
 	switch {
+	case c.opts.WSURL != "":
+		// WebSocket relay through Cloudflare Worker: bypasses ISP IP-based filtering
+		c.logger.Info("WebSocket relay mode", "url", c.opts.WSURL)
+		conn, err := transport.DialWebSocket(ctx, c.opts.WSURL)
+		if err != nil {
+			return fmt.Errorf("websocket relay failed: %w", err)
+		}
+		c.logger.Info("WebSocket relay connected")
+		c.conn = conn
 	case c.opts.InjectHost != "":
 		// HTTP Injection Engine: tunnel through ISP transparent proxy
 		method := transport.InjectCONNECT

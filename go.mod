@@ -12,6 +12,7 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/refraction-networking/utls v1.8.2 // indirect
 	golang.org/x/net v0.56.0 // indirect
