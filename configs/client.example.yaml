@@ -1,0 +1,31 @@
+# FGXP Client Configuration Example
+# ====================================
+
+server:
+  # Server address (host:port).
+  address: "example.com:443"
+  # Transport: tcp or quic
+  transport: "tcp"
+  # SNI hostname for TLS (for camouflage — use the server's domain)
+  sni: "example.com"
+
+auth:
+  method: "psk"
+  psk: "BASE64_ENCODED_PSK_HERE"
+
+stealth:
+  padding:
+    enabled: true
+    mode: "normalized"
+    min_pad: 0
+    max_pad: 255
+  timing:
+    enabled: true
+    jitter_ms: 50
+
+streams:
+  max_concurrent: 50
+  initial_window: 262144
+
+compression:
+  algorithm: "lz4"

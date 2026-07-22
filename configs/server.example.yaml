@@ -1,0 +1,102 @@
+# FGXP Server Configuration Example
+# ====================================
+# Copy this file to /etc/fgxp/server.yaml and modify as needed.
+
+server:
+  # Listen address (host:port). Default: ":443"
+  listen: ":443"
+  # Transport protocol: tcp, quic, or both. Default: "tcp"
+  transport: "tcp"
+
+tls:
+  # TLS certificate and key files (required).
+  cert: "/etc/fgxp/cert.pem"
+  key: "/etc/fgxp/key.pem"
+  # Optional: ACME automatic certificate management.
+  acme:
+    enabled: false
+    email: "admin@example.com"
+    domains:
+      - "example.com"
+      - "www.example.com"
+
+auth:
+  # Authentication method: psk (default)
+  method: "psk"
+  # Pre-shared keys. Multiple keys are supported for key rotation.
+  keys:
+    - id: "primary"
+      secret: "BASE64_ENCODED_PSK_HERE"
+      expires: "2026-12-31T23:59:59Z"
+    - id: "backup"
+      secret: "BASE64_ENCODED_BACKUP_PSK"
+      expires: "2027-06-30T23:59:59Z"
+
+stealth:
+  padding:
+    # Enable random padding to obscure frame sizes.
+    enabled: true
+    # Mode: "random" (uniform) or "normalized" (HTTPS-like sizes)
+    mode: "normalized"
+    min_pad: 0
+    max_pad: 255
+  timing:
+    # Enable inter-frame timing jitter.
+    enabled: true
+    jitter_ms: 50
+  camouflage:
+    # Mode: "static" or "reverse_proxy"
+    mode: "reverse_proxy"
+    # For static mode: directory of HTML files to serve.
+    static_dir: "/var/www/camouflage"
+    # For reverse_proxy mode: backend URL.
+    proxy_target: "https://real-website.com"
+
+streams:
+  # Maximum concurrent streams per connection.
+  max_concurrent: 100
+  # Initial flow control window per stream (bytes).
+  initial_window: 262144   # 256 KB
+  # Maximum flow control window (bytes).
+  max_window: 2147483647   # 2 GB - 1
+
+congestion:
+  # Algorithm: cubic, bbr, or none (for QUIC native CC)
+  algorithm: "cubic"
+
+compression:
+  # Algorithm: none, lz4 (fast), or zstd (better ratio)
+  algorithm: "lz4"
+
+limits:
+  # Maximum total connections.
+  max_connections: 10000
+  # Maximum streams per connection.
+  max_streams_per_conn: 100
+  # Idle session timeout.
+  idle_timeout: 5m
+  # Maximum time for TLS + auth handshake.
+  handshake_timeout: 10s
+
+observability:
+  metrics:
+    # Enable Prometheus metrics endpoint.
+    enabled: true
+    listen: ":9090"
+  logging:
+    # Log level: debug, info, warn, error
+    level: "info"
+    # Format: json or text
+    format: "json"
+  tracing:
+    # OpenTelemetry tracing (v0.4.0)
+    enabled: false
+    endpoint: "http://localhost:4318"
+
+cluster:
+  # Multi-node clustering (v0.5.0)
+  enabled: false
+  node_id: "node-1"
+  peers:
+    - "10.0.0.2:8443"
+    - "10.0.0.3:8443"
