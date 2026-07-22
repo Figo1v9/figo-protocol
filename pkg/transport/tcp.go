@@ -145,6 +145,12 @@ func (r *rawTCPConn) TransportType() Type {
 	return TCP
 }
 
+// WrapRawConn wraps a raw net.Conn into a transport.Conn.
+// Used by the HTTP Injection Engine to convert proxy tunnel connections.
+func WrapRawConn(conn net.Conn) Conn {
+	return &rawTCPConn{Conn: conn}
+}
+
 // DialRawTCP dials a raw TCP connection without a TLS wrapper.
 func DialRawTCP(ctx context.Context, addr string) (Conn, error) {
 	dialer := &net.Dialer{KeepAlive: 30 * time.Second}

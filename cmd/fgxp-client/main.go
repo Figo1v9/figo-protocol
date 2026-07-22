@@ -26,6 +26,8 @@ func main() {
 	psk := flag.String("psk", "", "Pre-shared key")
 	sni := flag.String("sni", "", "SNI hostname for TLS (camouflage)")
 	realIP := flag.String("real-ip", "", "Optional target IP for Domain Fronting and CDN routing")
+	injectHost := flag.String("inject", "", "Whitelisted host for HTTP Injection bypass (e.g. digital.gov.eg)")
+	injectMethod := flag.String("inject-method", "connect", "Injection method: connect, front, keepalive")
 	transportType := flag.String("transport", "tcp", "Transport: tcp or quic")
 	socksListen := flag.String("socks-listen", "127.0.0.1:1080", "SOCKS5 proxy listen address (host:port)")
 	logLevel := flag.String("log-level", "info", "Log level")
@@ -73,6 +75,8 @@ func main() {
 	clt, err := client.NewClient(client.ClientOptions{
 		ServerAddr:    *serverAddr,
 		RealIP:        *realIP,
+		InjectHost:    *injectHost,
+		InjectMethod:  *injectMethod,
 		TransportType: transType,
 		PSK:           []byte(*psk),
 		SNI:           *sni,

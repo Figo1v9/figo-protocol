@@ -30,6 +30,8 @@ type ClientOptions struct {
 	PSK           []byte
 	SNI           string
 	RealIP        string // Optional target IP override for Domain Fronting and CDN routing
+	InjectHost    string // Whitelisted host for HTTP Injection bypass (e.g. "digital.gov.eg")
+	InjectMethod  string // Injection method: "connect", "front", "keepalive" (default: "connect")
 	Config        *config.ClientConfig
 	TLSConfig     *tls.Config
 
@@ -173,6 +175,26 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.logger.Info("connecting to FGXP server", "addr", dialAddr, "transport", c.opts.TransportType.String(), "fingerprint", c.fingerprint(), "sni", sniHost)
 
 	switch {
+	case c.opts.InjectHost != "":
+		// HTTP Injection Engine: tunnel through ISP transparent proxy
+		method := transport.InjectCONNECT
+		switch c.opts.InjectMethod {
+		case "front":
+			method = transport.InjectFrontQuery
+		case "keepalive":
+			method = transport.InjectKeepAlive
+		}
+		c.logger.Info("HTTP injection mode", "host", c.opts.InjectHost, "method", string(method), "target", dialAddr)
+		rawConn, err := transport.DialWithHTTPInject(ctx, &transport.HTTPInjectConfig{
+			WhitelistedHost: c.opts.InjectHost,
+			TargetAddr:      dialAddr,
+			Method:          method,
+		})
+		if err != nil {
+			return fmt.Errorf("http injection failed: %w", err)
+		}
+		c.logger.Info("HTTP injection tunnel established", "host", c.opts.InjectHost)
+		c.conn = transport.WrapRawConn(rawConn)
 	case c.opts.TransportType == transport.QUIC:
 		// QUIC fingerprinting is out of scope for this iteration; use the
 		// standard QUIC dialer. See implementation plan §OUT OF SCOPE.
