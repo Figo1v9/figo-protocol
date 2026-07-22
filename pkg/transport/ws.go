@@ -107,8 +107,8 @@ func (c *wsConn) TransportType() Type {
 
 // DialWebSocket connects to a WebSocket endpoint (typically a Cloudflare Worker)
 // and returns a transport.Conn that wraps the WebSocket in a stream interface.
-// All FGXP reads/writes are automatically wrapped in WebSocket binary frames.
-func DialWebSocket(ctx context.Context, wsURL string) (Conn, error) {
+// If injectHost is provided, it sets the Host header to bypass ISP filters (Fronting).
+func DialWebSocket(ctx context.Context, wsURL string, injectHost string) (Conn, error) {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
 		TLSClientConfig: &tls.Config{
@@ -132,6 +132,9 @@ func DialWebSocket(ctx context.Context, wsURL string) (Conn, error) {
 
 	headers := http.Header{
 		"User-Agent": {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
+	}
+	if injectHost != "" {
+		headers.Set("Host", injectHost)
 	}
 
 	ws, _, err := dialer.DialContext(ctx, u.String(), headers)

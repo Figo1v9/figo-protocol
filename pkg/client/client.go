@@ -178,8 +178,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	switch {
 	case c.opts.WSURL != "":
 		// WebSocket relay through Cloudflare Worker: bypasses ISP IP-based filtering
-		c.logger.Info("WebSocket relay mode", "url", c.opts.WSURL)
-		conn, err := transport.DialWebSocket(ctx, c.opts.WSURL)
+		c.logger.Info("WebSocket relay mode", "url", c.opts.WSURL, "inject_host", c.opts.InjectHost)
+		conn, err := transport.DialWebSocket(ctx, c.opts.WSURL, c.opts.InjectHost)
 		if err != nil {
 			return fmt.Errorf("websocket relay failed: %w", err)
 		}
