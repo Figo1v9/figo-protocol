@@ -11,49 +11,93 @@
 
 import { connect } from 'cloudflare:sockets';
 
+function parseHostPort(addr, defaultPort = 443) {
+  const trimmed = String(addr || '').trim();
+  const lastColon = trimmed.lastIndexOf(':');
+  const lastBracket = trimmed.lastIndexOf(']');
+  let host = trimmed;
+  let port = defaultPort;
+
+  if (lastColon > lastBracket) {
+    host = trimmed.slice(0, lastColon);
+    const parsedPort = parseInt(trimmed.slice(lastColon + 1), 10);
+    if (!Number.isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
+      port = parsedPort;
+    }
+  }
+  if (host.startsWith('[') && host.endsWith(']')) {
+    host = host.slice(1, -1);
+  }
+  return { hostname: host, port };
+}
+
+function decoyResponse() {
+  return new Response(
+    '<!DOCTYPE html><html><head><title>Welcome to nginx!</title></head>' +
+    '<body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working.</p></body></html>',
+    { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+  );
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
 
-    // Camouflage: standard browser requests get a normal-looking page
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response(
-        '<!DOCTYPE html><html><head><title>Cloud Service</title></head>' +
-        '<body><h1>Service Online</h1><p>Status: OK</p></body></html>',
-        { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
-      );
+    // Camouflage: standard browser requests or mismatched secret paths get a 200 decoy page
+    if (upgradeHeader !== 'websocket') {
+      return decoyResponse();
+    }
+    if (env.WS_PATH && url.pathname !== env.WS_PATH) {
+      return decoyResponse();
     }
 
-    // Handle WebSocket upgrade
-    const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-
-    // Connect to backend FGXP VPS server via raw TCP
-    const targetVPS = env.TARGET_VPS_ADDR || "34.139.64.35:80";
-    const [host, portStr] = targetVPS.split(":");
-    const port = parseInt(portStr || "80", 10);
+    // Connect to backend FGXP VPS server via raw TCP before accepting WebSocket
+    const targetVPS = env.TARGET_VPS_ADDR || '34.139.64.35:443';
+    const { hostname, port } = parseHostPort(targetVPS, 443);
 
     let tcpSocket;
     try {
-      tcpSocket = connect({ hostname: host, port: port });
+      tcpSocket = connect({ hostname, port });
+      await tcpSocket.opened;
     } catch (err) {
-      server.close(1011, "Backend connection failed");
-      return new Response(null, { status: 101, webSocket: client });
+      try { tcpSocket?.close(); } catch (_) {}
+      return new Response('Backend TCP connect failed', { status: 502 });
     }
 
-    // Relay: WebSocket binary messages --> TCP socket
-    server.addEventListener("message", async (event) => {
-      try {
-        const writer = tcpSocket.writable.getWriter();
-        if (event.data instanceof ArrayBuffer) {
-          await writer.write(new Uint8Array(event.data));
-        } else if (typeof event.data === "string") {
-          await writer.write(new TextEncoder().encode(event.data));
-        }
-        writer.releaseLock();
-      } catch (err) {
-        server.close(1011, "TCP write failed");
+    // Accept WebSocket upgrade only after backend TCP connection is established
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+
+    const writer = tcpSocket.writable.getWriter();
+    const encoder = new TextEncoder();
+    let writeChain = Promise.resolve();
+    let closed = false;
+
+    const closeBoth = (code = 1000, reason = 'Closed') => {
+      if (closed) return;
+      closed = true;
+      try { writer.releaseLock(); } catch (_) {}
+      try { tcpSocket.close(); } catch (_) {}
+      try { server.close(code, reason); } catch (_) {}
+    };
+
+    // Relay: WebSocket binary messages --> TCP socket (single writer, serialized queue)
+    server.addEventListener('message', (event) => {
+      let chunk;
+      if (event.data instanceof ArrayBuffer) {
+        chunk = new Uint8Array(event.data);
+      } else if (ArrayBuffer.isView(event.data)) {
+        chunk = new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength);
+      } else if (typeof event.data === 'string') {
+        chunk = encoder.encode(event.data);
+      } else {
+        return;
       }
+
+      writeChain = writeChain
+        .then(() => writer.write(chunk))
+        .catch(() => closeBoth(1011, 'TCP write failed'));
     });
 
     // Relay: TCP socket --> WebSocket binary messages
@@ -65,23 +109,27 @@ export default {
             const { done, value } = await reader.read();
             if (done) break;
             if (value && value.byteLength > 0) {
-              server.send(value.buffer);
+              const payload =
+                value.byteOffset === 0 && value.byteLength === value.buffer.byteLength
+                  ? value.buffer
+                  : value.slice().buffer;
+              server.send(payload);
             }
           }
-        } catch (err) {
-          // TCP read error - close WebSocket
+        } catch (_) {
+          // TCP read error - close WebSocket cleanly below
         }
-        try { server.close(1000, "Backend closed"); } catch (e) {}
+        closeBoth(1000, 'Backend closed');
       })()
     );
 
-    // Clean up TCP on WebSocket close
-    server.addEventListener("close", () => {
-      try { tcpSocket.close(); } catch (e) {}
+    // Clean up TCP on WebSocket close or error
+    server.addEventListener('close', () => {
+      closeBoth(1000, 'Client closed');
     });
 
-    server.addEventListener("error", () => {
-      try { tcpSocket.close(); } catch (e) {}
+    server.addEventListener('error', () => {
+      closeBoth(1011, 'WebSocket error');
     });
 
     return new Response(null, { status: 101, webSocket: client });

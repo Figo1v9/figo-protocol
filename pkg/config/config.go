@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/figox/figox-protocol/pkg/stealth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -37,7 +38,10 @@ type ClientConfig struct {
 
 type ServerSection struct {
 	Listen    string `yaml:"listen"`
-	Transport string `yaml:"transport"` // tcp, quic, both
+	Transport string `yaml:"transport"` // tcp, quic, both, ws
+	NoTLS     bool   `yaml:"no_tls"`
+	WSPath    string `yaml:"ws_path"`
+	BehindCDN bool   `yaml:"behind_cdn"`
 }
 
 type ClientServerSection struct {
@@ -225,11 +229,52 @@ func setServerDefaults(cfg *ServerConfig) {
 	if cfg.Stealth.Camouflage.Mode == "" {
 		cfg.Stealth.Camouflage.Mode = "static"
 	}
+	if cfg.Stealth.Camouflage.ServerHeader == "" {
+		cfg.Stealth.Camouflage.ServerHeader = stealth.DefaultServerHeader
+	}
 	if cfg.Observability.Logging.Level == "" {
 		cfg.Observability.Logging.Level = "info"
 	}
 	if cfg.Observability.Logging.Format == "" {
 		cfg.Observability.Logging.Format = "json"
+	}
+}
+
+// ToStealthConfig maps YAML stealth configuration into the runtime stealth.Config.
+func ToStealthConfig(cfg *StealthSection) *stealth.Config {
+	if cfg == nil {
+		return stealth.DefaultConfig()
+	}
+	mode := stealth.CamouflageStatic
+	switch cfg.Camouflage.Mode {
+	case "reverse_proxy":
+		mode = stealth.CamouflageReverseProxy
+	case "none":
+		mode = stealth.CamouflageNone
+	}
+
+	serverHeader := cfg.Camouflage.ServerHeader
+	if serverHeader == "" {
+		serverHeader = stealth.DefaultServerHeader
+	}
+
+	return &stealth.Config{
+		Padding: stealth.PaddingConfig{
+			Enabled: cfg.Padding.Enabled,
+			Mode:    cfg.Padding.Mode,
+			MinPad:  cfg.Padding.MinPad,
+			MaxPad:  cfg.Padding.MaxPad,
+		},
+		Timing: stealth.TimingConfig{
+			Enabled:   cfg.Timing.Enabled,
+			MaxJitter: time.Duration(cfg.Timing.JitterMS) * time.Millisecond,
+		},
+		Camouflage: stealth.CamouflageConfig{
+			Mode:         mode,
+			StaticDir:    cfg.Camouflage.StaticDir,
+			ProxyTarget:  cfg.Camouflage.ProxyTarget,
+			ServerHeader: serverHeader,
+		},
 	}
 }
 

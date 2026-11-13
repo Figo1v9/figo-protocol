@@ -4,19 +4,72 @@ package transport
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/figox/figox-protocol/pkg/stealth"
 )
 
-// SendHTTPFraming sends an L7 HTTP GET / WebSocket Upgrade request
-// matching the specified transport URL (Path, Query, Host Header) over the raw/TLS connection.
-func SendHTTPFraming(conn Conn, parsed *ParsedTransportURL) error {
-	if parsed == nil || parsed.PathAndQuery == "" || parsed.PathAndQuery == "/" {
-		// No custom framing path required; proceed directly
-		return nil
+const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+func generateWebSocketKey() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw[:]), nil
+}
+
+func computeWebSocketAccept(key string) string {
+	sum := sha1.Sum([]byte(strings.TrimSpace(key) + wsGUID))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func isHTTPMethodPrefix(peek []byte) bool {
+	verbs := []string{"GET ", "POST", "HEAD", "PUT ", "DELE", "OPTI", "PATC", "CONN", "TRAC"}
+	for _, v := range verbs {
+		if len(peek) >= len(v) && string(peek[:len(v)]) == v {
+			return true
+		}
+	}
+	return false
+}
+
+// SendHTTPFraming sends an L7 HTTP GET / Upgrade request matching the parsed
+// transport URL or explicit Host header override. Returns a lossless Conn
+// wrapper retaining any buffered unread bytes from the HTTP response reader.
+func SendHTTPFraming(conn Conn, parsed *ParsedTransportURL, hostOverride string) (Conn, error) {
+	hostOverride = strings.TrimSpace(hostOverride)
+	if parsed == nil && hostOverride == "" {
+		return conn, nil
+	}
+
+	// Over TLS without an explicit custom path or explicit Host override, no extra
+	// inner HTTP upgrade framing is needed. Over plaintext TCP (!IsTLS), always
+	// emit the HTTP request so Host headers (e.g. http://safaricom.com) appear
+	// on the wire even on "/".
+	if hostOverride == "" && parsed != nil && parsed.IsTLS && (parsed.PathAndQuery == "" || parsed.PathAndQuery == "/") {
+		return conn, nil
+	}
+
+	pathAndQuery := "/"
+	if parsed != nil && parsed.PathAndQuery != "" {
+		pathAndQuery = parsed.PathAndQuery
+	}
+	hostHeader := NormalizeHTTPHost(parsed, hostOverride)
+	if hostHeader == "" {
+		hostHeader = "localhost"
+	}
+
+	wsKey, err := generateWebSocketKey()
+	if err != nil {
+		return nil, fmt.Errorf("generate websocket key: %w", err)
 	}
 
 	reqBuf := fmt.Sprintf(
@@ -27,102 +80,78 @@ func SendHTTPFraming(conn Conn, parsed *ParsedTransportURL) error {
 			"Connection: Upgrade\r\n"+
 			"Upgrade: websocket\r\n"+
 			"Sec-WebSocket-Version: 13\r\n"+
-			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
-		parsed.PathAndQuery,
-		parsed.Host,
+			"Sec-WebSocket-Key: %s\r\n\r\n",
+		pathAndQuery,
+		hostHeader,
+		wsKey,
 	)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write([]byte(reqBuf)); err != nil {
-		return fmt.Errorf("write http framing request: %w", err)
+		return nil, fmt.Errorf("write http framing request: %w", err)
 	}
 	_ = conn.SetWriteDeadline(time.Time{})
 
-	// Read HTTP 101 or 200 response line from server
 	br := bufio.NewReader(conn)
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	respLine, err := br.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("read http framing response: %w", err)
-	}
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
 	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return nil, fmt.Errorf("read http framing response: %w", err)
+	}
+	_ = resp.Body.Close()
 
-	if !strings.Contains(respLine, "101") && !strings.Contains(respLine, "200") {
-		return fmt.Errorf("unexpected http framing response: %s", strings.TrimSpace(respLine))
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, fmt.Errorf("unexpected http framing response: %d %s", resp.StatusCode, resp.Status)
 	}
 
-	// Drain remaining response headers until \r\n\r\n
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil || strings.TrimSpace(line) == "" {
-			break
-		}
-	}
-
-	return nil
+	return NewBufferedConn(conn, br), nil
 }
 
-// HandleHTTPFramingServer checks if the incoming connection starts with an HTTP request (e.g. GET /... HTTP/1.1).
-// If it is a legitimate FGXP HTTP Upgrade framing request, it consumes the header, writes an HTTP 101 response,
-// and returns the Conn ready for FGXP framing.
-// If it is a standard active probe HTTP request without Upgrade headers, it re-injects the request bytes so
-// camouflage active probe defense can handle it normally.
-func HandleHTTPFramingServer(conn Conn) (Conn, error) {
+// HandleHTTPFramingServer inspects the incoming legacy connection for an HTTP
+// Upgrade framing request. Returns (wrappedConn, true, nil) if an HTTP 101
+// upgrade succeeded, or (wrappedConn, false, nil) preserving the full request
+// bytes for camouflage fallback if not an FGXP upgrade.
+func HandleHTTPFramingServer(conn Conn) (Conn, bool, error) {
 	br := bufio.NewReader(conn)
 	peekBytes, err := br.Peek(4)
 	if err != nil {
-		if err == io.EOF {
-			return conn, nil
-		}
-		return conn, nil
+		return NewBufferedConn(conn, br), false, nil
 	}
 
-	isHTTP := bytes.HasPrefix(peekBytes, []byte("GET ")) ||
-		bytes.HasPrefix(peekBytes, []byte("POST")) ||
-		bytes.HasPrefix(peekBytes, []byte("HEAD")) ||
-		bytes.HasPrefix(peekBytes, []byte("CONN"))
-
-	if !isHTTP {
-		// Not HTTP framing; return buffered reader wrapped connection
-		return &framedTransportConn{Conn: conn, r: br}, nil
+	if !isHTTPMethodPrefix(peekBytes) {
+		return NewBufferedConn(conn, br), false, nil
 	}
 
-	// Read full HTTP request
 	req, err := http.ReadRequest(br)
 	if err != nil {
-		return nil, fmt.Errorf("parse incoming http framing request: %w", err)
+		return nil, false, fmt.Errorf("parse incoming http framing request: %w", err)
+	}
+
+	wsKey := strings.TrimSpace(req.Header.Get("Sec-WebSocket-Key"))
+	isUpgrade := req.Method == http.MethodGet &&
+		strings.EqualFold(req.Header.Get("Upgrade"), "websocket") &&
+		wsKey != ""
+
+	if !isUpgrade {
+		var reqDump bytes.Buffer
+		_ = req.Write(&reqDump)
+		_ = req.Body.Close()
+		multiReader := bufio.NewReader(io.MultiReader(&reqDump, br))
+		return NewBufferedConn(conn, multiReader), false, nil
 	}
 	_ = req.Body.Close()
 
-	// Check if this is genuine FGXP Upgrade framing vs regular HTTP active probe
-	isUpgrade := strings.EqualFold(req.Header.Get("Upgrade"), "websocket") || req.Header.Get("Sec-WebSocket-Key") != ""
-	if !isUpgrade {
-		// Not an FGXP framing upgrade; dump original request back to stream for camouflage handling
-		var reqDump bytes.Buffer
-		_ = req.Write(&reqDump)
-		multiReader := bufio.NewReader(io.MultiReader(&reqDump, br))
-		return &framedTransportConn{Conn: conn, r: multiReader}, nil
-	}
-
-	// Respond with 101 Switching Protocols
+	accept := computeWebSocketAccept(wsKey)
 	respBuf := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
-		"Server: nginx/1.25.3\r\n\r\n"
+		"Sec-WebSocket-Accept: " + accept + "\r\n" +
+		"Server: " + stealth.DefaultServerHeader + "\r\n\r\n"
 
 	if _, err := conn.Write([]byte(respBuf)); err != nil {
-		return nil, fmt.Errorf("write http framing 101 response: %w", err)
+		return nil, false, fmt.Errorf("write http framing 101 response: %w", err)
 	}
 
-	return &framedTransportConn{Conn: conn, r: br}, nil
-}
-
-// framedTransportConn adapts bufio.Reader to transport.Conn without losing ConnectionState() or TransportType().
-type framedTransportConn struct {
-	Conn
-	r *bufio.Reader
-}
-
-func (f *framedTransportConn) Read(p []byte) (int, error) {
-	return f.r.Read(p)
+	return NewBufferedConn(conn, br), true, nil
 }

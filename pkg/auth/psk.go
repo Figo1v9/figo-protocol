@@ -28,6 +28,37 @@ func NewPSKAuthenticator(store PSKStore) *PSKAuthenticator {
 	return a
 }
 
+// DeadlineSetter is optionally implemented by FrameReadWriter adapters backed
+// by network connections so Authenticate enforces HandshakeTimeout / ctx cancellation.
+type DeadlineSetter interface {
+	SetDeadline(time.Time) error
+}
+
+func bindAuthDeadline(ctx context.Context, rw FrameReadWriter) func() {
+	ds, ok := rw.(DeadlineSetter)
+	if !ok || ctx == nil {
+		return func() {}
+	}
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		_ = ds.SetDeadline(deadline)
+	}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			_ = ds.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+		_ = ds.SetDeadline(time.Time{})
+	}
+}
+
 // Authenticate performs the server-side PSK authentication exchange.
 //
 // Protocol:
@@ -38,6 +69,9 @@ func NewPSKAuthenticator(store PSKStore) *PSKAuthenticator {
 //  5. Verify HMAC = HMAC-SHA256(PSK, clientNonce || serverNonce || timestamp)
 //  6. Send AUTH(SUCCESS) with SessionID + ResumptionToken, or AUTH(FAILURE)
 func (a *PSKAuthenticator) Authenticate(ctx context.Context, rw FrameReadWriter) (Result, error) {
+	cleanup := bindAuthDeadline(ctx, rw)
+	defer cleanup()
+
 	// Phase 1: Read INIT
 	initFrame, err := rw.ReadFrame()
 	if err != nil {
@@ -295,6 +329,9 @@ func NewPSKClientAuthenticator(psk []byte) *PSKClientAuthenticator {
 
 // Authenticate performs the client-side PSK authentication exchange.
 func (a *PSKClientAuthenticator) Authenticate(ctx context.Context, rw FrameReadWriter) (Result, error) {
+	cleanup := bindAuthDeadline(ctx, rw)
+	defer cleanup()
+
 	keyID := ComputeKeyID(a.psk)
 	clientNonce, err := fgxpcrypto.GenerateNonce(protocol.NonceLength)
 	if err != nil {

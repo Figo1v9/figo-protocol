@@ -5,12 +5,17 @@
 
 **FigoX Protocol (FGXP)** is a premium, next-generation stealth transport protocol built from scratch in Go. It is designed to bypass state-of-the-art Deep Packet Inspection (DPI) firewalls by embedding multiplexed data streams within standard TLS 1.3 or HTTP/3 (QUIC) connections, making FGXP traffic look completely identical to normal web browsing (HTTPS).
 
-- **Full Transport URL & L7 HTTP Framing:** Automatically parses full URLs (`https://host:port/path?query`) into clean TLS SNI and L7 HTTP GET request lines to bypass strict host filtering.
+- **CDN WebSocket Transport (`ws` / `wss`):** Full RFC 6455 bidirectional WebSocket server and uTLS Chrome (`http/1.1` ALPN) client with secret upgrade path (`--ws-path`), CDN proxy header handling (`--behind-cdn`), decoupled `--host` vs `--sni`, and active probe decoy fallback (`200 OK` nginx page).
+- **Full Transport URL & L7 HTTP Framing:** Automatically parses full URLs (`http://host/`, `https://host:port/path?query`) into TLS SNI and L7 HTTP framing requests (including root `/` `Host` injection on port 80) plus HTTP Inject proxies (`--proxy`, `--inject`).
 - **Domain Fronting & RealIP Override:** Dial target VPS/CDN IPs directly with `--real-ip` while keeping whitelisted SNI camouflage.
 - **uTLS Browser Parity:** Employs uTLS to mirror Google Chrome / Firefox TLS ClientHello fingerprints byte-for-byte (JA3/JA4 evasion).
-- **Dual-Transport Evasion:** Fully supports standard TCP + TLS 1.3 tunnels and HTTP/3-mimicked QUIC streams.
+- **Dual-Transport Evasion:** Fully supports TCP + TLS 1.3, WebSocket over TLS/Plaintext (`ws`/`wss`), and HTTP/3-mimicked QUIC streams.
 - **Active Probe Resistance:** Timing-safe first-byte inspection handles unauthenticated active probes by silently routing them to a camouflage fallback server (Static web page or Reverse Proxy to a legitimate site) acting exactly like Nginx.
 - **High Performance & Zero Data Loss:** Stream multiplexing with backpressure flow control, 64MB flow control windows, unread byte buffering, and zero-copy buffer pooling (`sync.Pool`) for gigabit-speed throughput (18.84+ MB/s).
+
+### History
+1. **2026-11-13:** Upgraded FGXP to full CDN-compatible RFC 6455 WebSocket (`ws`/`wss` + `--ws-path` + `--behind-cdn` + uTLS HTTP/1.1 ALPN), fixed plaintext `Host` HTTP framing (`--sni "http://..."` / `--host`), added `--proxy` / `--inject-tls`, hardened `cloudflare_worker_relay.js`, and added `--mode ws` to `deploy/install-ubuntu.sh`.
+2. **2026-11-12:** Added automated Ubuntu/Debian `systemd` one-command installer (`deploy/install-ubuntu.sh`) and repaired installer scripts.
 
 📖 **Documentation & Deployment Guides:**
 - ⚡ **[Quick Start Deployment Guide (PowerShell & SSH)](file:///d:/lab/figox-protocol/docs/QUICK_START_GUIDE.md)**
@@ -148,10 +153,17 @@ curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/i
    ```bash
    curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --domain vpn.yourdomain.com --email you@example.com
    ```
-3. **بدون TLS (`--no-tls` على بورت `80`) لربط Cloudflare Worker Relay أو HTTP Injection:**
+3. **نمط CDN WebSocket (`--mode ws` + مسار سري `/ws-...`) للعمل خلف Imperva CDN / Cloudflare CDN:**
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --mode ws --domain vpn.yourdomain.com
+   ```
+4. **بدون TLS (`--no-tls` على بورت `80`) لربط Cloudflare Worker Relay أو HTTP Injection:**
    ```bash
    curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --no-tls --sni www.cloudflare.com
    ```
+
+> **ملاحظة مهمة بخصوص هوستات Imperva CDN (مثل `http://safaricom.com`):**
+> البروتوكول نفسه لا يمتلك IPs شبكة Imperva (`AS19551`) الخاصة؛ لذا للعبور من شبكة تحظر كل ما عدا CDN يجب إما ربط دومين خاص بك على Cloudflare/Imperva مع تفعيل وضع WebSocket (`--mode ws`) أو استخدام `--no-tls` على بورت `80` مع `--sni "http://safaricom.com"` / `--host safaricom.com` إذا كان الفحص يعتمد على ترويسة `Host` فقط.
 
 بعد انتهاء التثبيت هتلاقي أمر العميل الجاهز على الشاشة ومحفوظ في `/etc/fgxp/client-info.txt`. ولأغراض الإنتاج، غيّر الشهادات التجريبية الافتراضية في الجذر (`cert.pem` / `key.pem`) دائماً ولا تشارك الـ PSK علناً.
 

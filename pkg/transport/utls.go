@@ -11,6 +11,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"time"
 
@@ -83,11 +84,12 @@ func (c *utlsConn) SetReadDeadline(t time.Time) error   { return c.conn.SetReadD
 func (c *utlsConn) SetWriteDeadline(t time.Time) error  { return c.conn.SetWriteDeadline(t) }
 
 func (c *utlsConn) ConnectionState() tls.ConnectionState {
-	s := c.conn.ConnectionState()
-	// uTLS returns its own ConnectionState type. The transport contract only
-	// needs the standard crypto/tls fields, which have identical names and
-	// meanings, so we copy them across. Peer certificate chains are not used
-	// by FGXP (PSK auth), so they are intentionally omitted.
+	return copyUTLSConnState(c.conn.ConnectionState())
+}
+
+func (c *utlsConn) TransportType() Type { return TCP }
+
+func copyUTLSConnState(s utls.ConnectionState) tls.ConnectionState {
 	return tls.ConnectionState{
 		Version:                     s.Version,
 		HandshakeComplete:           s.HandshakeComplete,
@@ -104,55 +106,190 @@ func (c *utlsConn) ConnectionState() tls.ConnectionState {
 	}
 }
 
-func (c *utlsConn) TransportType() Type { return TCP }
-
-// DialUTLS establishes a TCP connection and performs a uTLS handshake that
-// mimics the chosen browser fingerprint. tlsCfg provides ServerName, trust
-// roots and ALPN; it is copied into a uTLS Config because uTLS reuses the same
-// shape (utls.Config embeds the standard crypto/tls Config fields).
-func DialUTLS(ctx context.Context, addr string, tlsCfg *tls.Config, fingerprint string) (Conn, error) {
+func buildUTLSConfig(tlsCfg *tls.Config, forceHTTP1 bool) *utls.Config {
 	if tlsCfg == nil {
 		tlsCfg = &tls.Config{}
 	}
-
-	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
-	rawConn, err := dialer.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, err
+	nextProtos := tlsCfg.NextProtos
+	if forceHTTP1 {
+		nextProtos = []string{"http/1.1"}
 	}
-
-	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
-		_ = tcpConn.SetReadBuffer(4194304)  // 4MB receive buffer
-		_ = tcpConn.SetWriteBuffer(4194304) // 4MB send buffer
-	}
-
 	uCfg := &utls.Config{
 		ServerName:         tlsCfg.ServerName,
 		InsecureSkipVerify: tlsCfg.InsecureSkipVerify,
 		RootCAs:            tlsCfg.RootCAs,
-		NextProtos:         tlsCfg.NextProtos,
+		NextProtos:         nextProtos,
 		MinVersion:         tlsCfg.MinVersion,
 		MaxVersion:         tlsCfg.MaxVersion,
 	}
-	// When verification is disabled we must not also reject the (decoy) SNI
-	// host; InsecureServerNameToVerify handles that for uTLS.
 	if uCfg.InsecureSkipVerify {
-		uCfg.InsecureServerNameToVerify = "" // already skipped via InsecureSkipVerify
+		uCfg.InsecureServerNameToVerify = ""
 	} else if uCfg.ServerName != "" {
 		uCfg.InsecureServerNameToVerify = uCfg.ServerName
 	}
+	return uCfg
+}
 
-	uConn := utls.UClient(rawConn, uCfg, resolveClientHelloID(fingerprint))
+func cloneStdTLSConfig(tlsCfg *tls.Config, forceHTTP1 bool) *tls.Config {
+	var cfg *tls.Config
+	if tlsCfg == nil {
+		cfg = &tls.Config{}
+	} else {
+		cfg = tlsCfg.Clone()
+	}
+	if forceHTTP1 {
+		cfg.NextProtos = []string{"http/1.1"}
+	}
+	return cfg
+}
+
+// buildHTTP1Spec clones a browser ClientHelloSpec and forces ALPN to ["http/1.1"]
+// while stripping ALPS ("h2") extensions so HTTP/1.1 WebSocket upgrades remain
+// compliant without falling back to the Go TLS fingerprint.
+func buildHTTP1Spec(fingerprint string) (utls.ClientHelloSpec, error) {
+	helloID := resolveClientHelloID(fingerprint)
+	if fingerprint == FingerprintRandomized {
+		helloID = utls.HelloRandomizedALPN
+	}
+	spec, err := utls.UTLSIdToSpec(helloID)
+	if err != nil {
+		return utls.ClientHelloSpec{}, fmt.Errorf("fgxp/transport: resolve utls spec %q: %w", fingerprint, err)
+	}
+
+	filtered := make([]utls.TLSExtension, 0, len(spec.Extensions)+1)
+	alpnUpdated := false
+	insertIdx := -1
+
+	for _, ext := range spec.Extensions {
+		switch e := ext.(type) {
+		case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
+			// Strip HTTP/2 ALPS extensions when forcing http/1.1 ALPN.
+			continue
+		case *utls.ALPNExtension:
+			e.AlpnProtocols = []string{"http/1.1"}
+			alpnUpdated = true
+			filtered = append(filtered, e)
+		case *utls.UtlsPaddingExtension, *utls.UtlsPreSharedKeyExtension:
+			if insertIdx == -1 {
+				insertIdx = len(filtered)
+			}
+			filtered = append(filtered, ext)
+		default:
+			filtered = append(filtered, ext)
+		}
+	}
+
+	if !alpnUpdated {
+		alpnExt := &utls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}}
+		if insertIdx >= 0 && insertIdx <= len(filtered) {
+			filtered = append(filtered[:insertIdx], append([]utls.TLSExtension{alpnExt}, filtered[insertIdx:]...)...)
+		} else {
+			filtered = append(filtered, alpnExt)
+		}
+	}
+
+	spec.Extensions = filtered
+	return spec, nil
+}
+
+func tuneTCPSocket(rawConn net.Conn) {
+	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetReadBuffer(4194304)
+		_ = tcpConn.SetWriteBuffer(4194304)
+	}
+}
+
+func dialRawTLS(ctx context.Context, rawConn net.Conn, tlsCfg *tls.Config, fingerprint string, http1Only bool) (net.Conn, tls.ConnectionState, error) {
+	if !IsUTLSFingerprint(fingerprint) {
+		stdConn := tls.Client(rawConn, cloneStdTLSConfig(tlsCfg, http1Only))
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = stdConn.SetDeadline(deadline)
+		}
+		if err := stdConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, tls.ConnectionState{}, err
+		}
+		_ = stdConn.SetDeadline(time.Time{})
+		return stdConn, stdConn.ConnectionState(), nil
+	}
+
+	uCfg := buildUTLSConfig(tlsCfg, http1Only)
+	var uConn *utls.UConn
+	if http1Only {
+		spec, err := buildHTTP1Spec(fingerprint)
+		if err != nil {
+			rawConn.Close()
+			return nil, tls.ConnectionState{}, err
+		}
+		uConn = utls.UClient(rawConn, uCfg, utls.HelloCustom)
+		if err := uConn.ApplyPreset(&spec); err != nil {
+			rawConn.Close()
+			return nil, tls.ConnectionState{}, err
+		}
+	} else {
+		uConn = utls.UClient(rawConn, uCfg, resolveClientHelloID(fingerprint))
+	}
 
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = uConn.SetDeadline(deadline)
 	}
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		rawConn.Close()
-		return nil, err
+		return nil, tls.ConnectionState{}, err
 	}
 	_ = uConn.SetDeadline(time.Time{})
 
-	return &utlsConn{conn: uConn}, nil
+	return uConn, copyUTLSConnState(uConn.ConnectionState()), nil
+}
+
+// DialUTLS establishes a TCP connection and performs a uTLS handshake that
+// mimics the chosen browser fingerprint.
+func DialUTLS(ctx context.Context, addr string, tlsCfg *tls.Config, fingerprint string) (Conn, error) {
+	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
+	rawConn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	tuneTCPSocket(rawConn)
+
+	tlsConn, _, err := dialRawTLS(ctx, rawConn, tlsCfg, fingerprint, false)
+	if err != nil {
+		return nil, err
+	}
+	return wrapTLSNetConn(tlsConn), nil
+}
+
+// DialUTLSOverConn layers a uTLS (or standard TLS when fingerprint=="none")
+// handshake on top of an already-established net.Conn (e.g. an HTTP CONNECT tunnel).
+func DialUTLSOverConn(ctx context.Context, rawConn net.Conn, tlsCfg *tls.Config, fingerprint string) (Conn, error) {
+	tlsConn, _, err := dialRawTLS(ctx, rawConn, tlsCfg, fingerprint, false)
+	if err != nil {
+		return nil, err
+	}
+	return wrapTLSNetConn(tlsConn), nil
+}
+
+// DialUTLSHTTP1 dials addr over TCP and performs a uTLS handshake restricted to
+// HTTP/1.1 ALPN so WebSocket clients keep browser JA3/JA4 mimicry.
+func DialUTLSHTTP1(ctx context.Context, addr string, tlsCfg *tls.Config, fingerprint string) (net.Conn, tls.ConnectionState, error) {
+	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
+	rawConn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, tls.ConnectionState{}, err
+	}
+	tuneTCPSocket(rawConn)
+
+	return dialRawTLS(ctx, rawConn, tlsCfg, fingerprint, true)
+}
+
+func wrapTLSNetConn(c net.Conn) Conn {
+	switch typed := c.(type) {
+	case *utls.UConn:
+		return &utlsConn{conn: typed}
+	case *tls.Conn:
+		return &tcpConn{conn: typed}
+	default:
+		return WrapRawConn(c)
+	}
 }

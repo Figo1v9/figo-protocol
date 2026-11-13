@@ -36,9 +36,13 @@ func TestHTTPFramingEndToEnd(t *testing.T) {
 		defer rawConn.Close()
 
 		tConn := &mockTransportConn{Conn: rawConn}
-		framedConn, err := HandleHTTPFramingServer(tConn)
+		framedConn, upgraded, err := HandleHTTPFramingServer(tConn)
 		if err != nil {
 			srvErrCh <- err
+			return
+		}
+		if !upgraded {
+			srvErrCh <- io.ErrUnexpectedEOF
 			return
 		}
 
@@ -66,17 +70,18 @@ func TestHTTPFramingEndToEnd(t *testing.T) {
 		t.Fatalf("ParseTransportURL failed: %v", err)
 	}
 
-	if err := SendHTTPFraming(clientConn, parsedURL); err != nil {
+	framedClientConn, err := SendHTTPFraming(clientConn, parsedURL, "")
+	if err != nil {
 		t.Fatalf("SendHTTPFraming failed: %v", err)
 	}
 
 	testPayload := []byte("FGXP_ENCRYPTED_STREAM_TEST")
-	if _, err := clientConn.Write(testPayload); err != nil {
+	if _, err := framedClientConn.Write(testPayload); err != nil {
 		t.Fatalf("client write error: %v", err)
 	}
 
 	respBuf := make([]byte, 64)
-	n, err := clientConn.Read(respBuf)
+	n, err := framedClientConn.Read(respBuf)
 	if err != nil {
 		t.Fatalf("client read error: %v", err)
 	}

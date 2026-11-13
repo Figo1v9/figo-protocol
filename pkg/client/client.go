@@ -8,7 +8,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,16 +28,21 @@ import (
 
 // ClientOptions configures the FGXP client.
 type ClientOptions struct {
-	ServerAddr    string
-	TransportType transport.Type
-	PSK           []byte
-	SNI           string
-	RealIP        string // Optional target IP override for Domain Fronting and CDN routing
-	InjectHost    string // Whitelisted host for HTTP Injection bypass (e.g. "digital.gov.eg")
-	InjectMethod  string // Injection method: "connect", "front", "keepalive" (default: "connect")
-	WSURL         string // Cloudflare Worker WebSocket relay URL (e.g. wss://my-relay.workers.dev)
-	Config        *config.ClientConfig
-	TLSConfig     *tls.Config
+	ServerAddr         string
+	TransportType      transport.Type
+	PSK                []byte
+	SNI                string
+	HostHeader         string        // Explicit HTTP Host header override (decoupled from SNI and DialAddr)
+	RealIP             string        // Optional target IP override for Domain Fronting and CDN routing
+	InjectHost         string        // Whitelisted host for HTTP Injection bypass (e.g. "safaricom.com")
+	InjectMethod       string        // Injection method: "connect", "front", "keepalive" (default: "connect")
+	ProxyAddr          string        // Optional explicit HTTP proxy address for --inject mode
+	InjectTLS          bool          // Layer uTLS inside HTTP CONNECT / front injection tunnel
+	WSURL              string        // RFC 6455 WebSocket endpoint or CDN/Worker relay URL
+	WSHeartbeat        time.Duration // RFC 6455 Ping keepalive interval (defaults to 20s when 0; <0 disables)
+	Config             *config.ClientConfig
+	TLSConfig          *tls.Config
+	InsecureSkipVerify *bool // Optional explicit TLS verification override
 
 	// Fingerprint selects the TLS ClientHello mimicry used by the client to
 	// evade handshake-based DPI (JA3/JA4). Supported values are defined in the
@@ -98,7 +105,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	logger := observability.NewLogger("info", "json")
 	metrics := observability.NewMetrics()
 	authenticator := auth.NewPSKClientAuthenticator(opts.PSK)
-	stealthEngine := stealth.NewEngine(toStealthConfig(&opts.Config.Stealth))
+	stealthEngine := stealth.NewEngine(config.ToStealthConfig(&opts.Config.Stealth))
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -111,34 +118,6 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		ctx:           ctx,
 		cancel:        cancel,
 	}, nil
-}
-
-func toStealthConfig(cfg *config.StealthSection) *stealth.Config {
-	mode := stealth.CamouflageStatic
-	if cfg.Camouflage.Mode == "reverse_proxy" {
-		mode = stealth.CamouflageReverseProxy
-	} else if cfg.Camouflage.Mode == "none" {
-		mode = stealth.CamouflageNone
-	}
-
-	return &stealth.Config{
-		Padding: stealth.PaddingConfig{
-			Enabled: cfg.Padding.Enabled,
-			Mode:    cfg.Padding.Mode,
-			MinPad:  cfg.Padding.MinPad,
-			MaxPad:  cfg.Padding.MaxPad,
-		},
-		Timing: stealth.TimingConfig{
-			Enabled:   cfg.Timing.Enabled,
-			MaxJitter: time.Duration(cfg.Timing.JitterMS) * time.Millisecond,
-		},
-		Camouflage: stealth.CamouflageConfig{
-			Mode:         mode,
-			StaticDir:    cfg.Camouflage.StaticDir,
-			ProxyTarget:  cfg.Camouflage.ProxyTarget,
-			ServerHeader: cfg.Camouflage.ServerHeader,
-		},
-	}
 }
 
 // Connect establishes the connection to the FGXP server and completes authentication.
@@ -159,8 +138,14 @@ func (c *Client) Connect(ctx context.Context) error {
 			ServerName:         sniHost,
 			InsecureSkipVerify: false,
 		}
-	} else if tlsCfg.ServerName == "" || tlsCfg.ServerName == c.opts.SNI {
-		tlsCfg.ServerName = sniHost
+	} else {
+		tlsCfg = tlsCfg.Clone()
+		if tlsCfg.ServerName == "" || tlsCfg.ServerName == c.opts.SNI {
+			tlsCfg.ServerName = sniHost
+		}
+	}
+	if c.opts.InsecureSkipVerify != nil {
+		tlsCfg.InsecureSkipVerify = *c.opts.InsecureSkipVerify
 	}
 
 	// Realistic ALPN so the ClientHello looks like a browser negotiating
@@ -178,54 +163,86 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	switch {
 	case c.opts.WSURL != "":
-		// WebSocket relay through Cloudflare Worker with CDN Fronting:
-		// SNI = Free host for ISP DPI bypass (e.g. digital.gov.eg)
-		// Host Header = Worker domain for Cloudflare internal routing (e.g. my-vpn-relay.workers.dev)
-		hostHeader := ""
-		if parsedURL, err := url.Parse(c.opts.WSURL); err == nil {
-			hostHeader = parsedURL.Host
+		// RFC 6455 WebSocket transport for CDN (Imperva / Cloudflare / Nginx)
+		// or Cloudflare Worker relays with separated SNI, HTTP Host, and DialAddr.
+		hostHeader := strings.TrimSpace(c.opts.HostHeader)
+		if hostHeader == "" {
+			if parsedWS, parseErr := url.Parse(c.opts.WSURL); parseErr == nil {
+				hostHeader = parsedWS.Host
+			}
 		}
-		c.logger.Info("WebSocket relay mode with CDN Fronting", "url", c.opts.WSURL, "sni", sniHost, "host_header", hostHeader)
+		pingInterval := c.opts.WSHeartbeat
+		if pingInterval == 0 {
+			pingInterval = 20 * time.Second
+		} else if pingInterval < 0 {
+			pingInterval = 0
+		}
+		c.logger.Info("WebSocket CDN/Origin transport", "url", c.opts.WSURL, "sni", sniHost, "host_header", hostHeader, "dial_ip", c.opts.RealIP)
 		conn, err := transport.DialWebSocket(ctx, transport.DialWebSocketOptions{
-			WSURL:      c.opts.WSURL,
-			SNI:        sniHost,
-			HostHeader: hostHeader,
+			WSURL:              c.opts.WSURL,
+			SNI:                sniHost,
+			HostHeader:         hostHeader,
+			DialAddr:           c.opts.RealIP,
+			Fingerprint:        c.fingerprint(),
+			InsecureSkipVerify: tlsCfg.InsecureSkipVerify,
+			RootCAs:            tlsCfg.RootCAs,
+			PingInterval:       pingInterval,
 		})
 		if err != nil {
-			return fmt.Errorf("websocket relay failed: %w", err)
+			return fmt.Errorf("websocket dial failed: %w", err)
 		}
-		c.logger.Info("WebSocket relay connected successfully")
+		c.logger.Info("WebSocket transport connected")
 		c.conn = conn
 	case c.opts.InjectHost != "":
-		// HTTP Injection Engine: tunnel through ISP transparent proxy
 		method := transport.InjectCONNECT
 		switch c.opts.InjectMethod {
 		case "front":
 			method = transport.InjectFrontQuery
 		case "keepalive":
+			if c.opts.InjectTLS {
+				return fmt.Errorf("inject-tls is not supported with keepalive method (requires CONNECT tunnel)")
+			}
 			method = transport.InjectKeepAlive
 		}
-		c.logger.Info("HTTP injection mode", "host", c.opts.InjectHost, "method", string(method), "target", dialAddr)
+		c.logger.Info("HTTP injection mode", "host", c.opts.InjectHost, "method", string(method), "target", dialAddr, "proxy", c.opts.ProxyAddr)
 		rawConn, err := transport.DialWithHTTPInject(ctx, &transport.HTTPInjectConfig{
 			WhitelistedHost: c.opts.InjectHost,
 			TargetAddr:      dialAddr,
+			ProxyAddr:       c.opts.ProxyAddr,
 			Method:          method,
 		})
 		if err != nil {
 			return fmt.Errorf("http injection failed: %w", err)
 		}
+		if c.opts.InjectTLS {
+			tunnelSNI := sniHost
+			if tunnelSNI == "" {
+				if h, _, splitErr := net.SplitHostPort(dialAddr); splitErr == nil {
+					tunnelSNI = h
+				} else {
+					tunnelSNI = dialAddr
+				}
+			}
+			tunnelTLSCfg := tlsCfg.Clone()
+			tunnelTLSCfg.ServerName = tunnelSNI
+			tlsConn, tlsErr := transport.DialUTLSOverConn(ctx, rawConn, tunnelTLSCfg, c.fingerprint())
+			if tlsErr != nil {
+				rawConn.Close()
+				return fmt.Errorf("tls over http inject tunnel failed: %w", tlsErr)
+			}
+			c.conn = tlsConn
+		} else {
+			c.conn = transport.WrapRawConn(rawConn)
+		}
 		c.logger.Info("HTTP injection tunnel established", "host", c.opts.InjectHost)
-		c.conn = transport.WrapRawConn(rawConn)
 	case c.opts.TransportType == transport.QUIC:
-		// QUIC fingerprinting is out of scope for this iteration; use the
-		// standard QUIC dialer. See implementation plan §OUT OF SCOPE.
 		conn, err := transport.NewQUICDialer(tlsCfg).Dial(ctx, dialAddr)
 		if err != nil {
 			return fmt.Errorf("transport dial quic: %w", err)
 		}
 		c.conn = conn
 	case parsedURL != nil && !parsedURL.IsTLS:
-		// Plaintext HTTP Framing mode (e.g. http://digital.gov.eg/)
+		// Plaintext HTTP Framing mode (e.g. http://safaricom.com)
 		conn, err := transport.DialRawTCP(ctx, dialAddr)
 		if err != nil {
 			return fmt.Errorf("transport dial raw tcp: %w", err)
@@ -247,11 +264,18 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	conn := c.conn
 
-	// If a full transport URL with path/query was specified, send HTTP Handshake framing
-	if parsedURL != nil && parsedURL.PathAndQuery != "/" {
-		if err := transport.SendHTTPFraming(conn, parsedURL); err != nil {
-			conn.Close()
-			return fmt.Errorf("http transport framing failed: %w", err)
+	// Legacy L7 HTTP Upgrade framing applies only to direct TCP/TLS streams (never WS, Inject, or QUIC).
+	if c.opts.WSURL == "" && c.opts.InjectHost == "" && c.opts.TransportType != transport.QUIC {
+		shouldFrame := strings.TrimSpace(c.opts.HostHeader) != "" ||
+			(parsedURL != nil && (!parsedURL.IsTLS || parsedURL.PathAndQuery != "/"))
+		if shouldFrame {
+			framedConn, frameErr := transport.SendHTTPFraming(conn, parsedURL, c.opts.HostHeader)
+			if frameErr != nil {
+				conn.Close()
+				return fmt.Errorf("http transport framing failed: %w", frameErr)
+			}
+			conn = framedConn
+			c.conn = conn
 		}
 	}
 
@@ -543,6 +567,10 @@ func (c *Client) handleStreamWrites(st *stream.Stream) {
 // on the wire and defeat the statistical evasion goal.
 type connReadWriter struct {
 	conn transport.Conn
+}
+
+func (crw *connReadWriter) SetDeadline(t time.Time) error {
+	return crw.conn.SetDeadline(t)
 }
 
 func (crw *connReadWriter) ReadFrame() (*protocol.Frame, error) {

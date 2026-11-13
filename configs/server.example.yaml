@@ -5,8 +5,15 @@
 server:
   # Listen address (host:port). Default: ":443"
   listen: ":443"
-  # Transport protocol: tcp, quic, or both. Default: "tcp"
+  # Transport protocol: tcp, quic, ws, or both. Default: "tcp"
   transport: "tcp"
+  # Plain HTTP / WS mode (for behind reverse proxy, CDN Flexible SSL, or HTTP inject proxies)
+  no_tls: false
+  # Secret WebSocket upgrade path required when transport is "ws" (e.g. "/ws-a1b2c3d4", must not be "/").
+  # Empty "" selects legacy direct/HTTP-framing mode.
+  ws_path: ""
+  # Extract client real IP from CF-Connecting-IP / Incap-Client-IP / X-Forwarded-For in logs
+  behind_cdn: false
 
 tls:
   # TLS certificate and key files (required unless running with --no-tls).

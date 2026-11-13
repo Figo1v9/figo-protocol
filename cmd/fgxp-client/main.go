@@ -22,13 +22,18 @@ import (
 )
 
 func main() {
-	serverAddr := flag.String("server", "", "Server address (host:port)")
+	serverAddr := flag.String("server", "", "Server address (host:port; optional when --ws is specified)")
 	psk := flag.String("psk", "", "Pre-shared key")
-	sni := flag.String("sni", "", "SNI hostname for TLS (camouflage)")
-	realIP := flag.String("real-ip", "", "Optional target IP for Domain Fronting and CDN routing")
-	injectHost := flag.String("inject", "", "Whitelisted host for HTTP Injection bypass (e.g. digital.gov.eg)")
+	sni := flag.String("sni", "", "SNI hostname for TLS handshake mimicry (e.g. safaricom.com)")
+	hostHeader := flag.String("host", "", "Explicit HTTP Host header override (for CDN / WebSocket / HTTP framing)")
+	realIP := flag.String("real-ip", "", "Target IP[:port] override (CDN edge IP / Domain Fronting)")
+	injectHost := flag.String("inject", "", "Whitelisted host for HTTP Injection bypass (e.g. safaricom.com)")
 	injectMethod := flag.String("inject-method", "connect", "Injection method: connect, front, keepalive")
-	wsURL := flag.String("ws", "", "Cloudflare Worker WebSocket relay URL (e.g. wss://my-relay.workers.dev)")
+	proxyAddr := flag.String("proxy", "", "Explicit HTTP proxy address (host:port) for --inject mode")
+	injectTLS := flag.Bool("inject-tls", false, "Layer uTLS inside HTTP CONNECT / front injection tunnel")
+	wsURL := flag.String("ws", "", "RFC 6455 WebSocket URL (e.g. wss://your-domain.com/ws-secret or wss://relay.workers.dev)")
+	fingerprint := flag.String("fingerprint", transport.FingerprintChrome, "TLS fingerprint mimicry: chrome, firefox, edge, randomized, none")
+	insecure := flag.Bool("insecure", true, "Skip TLS certificate verification (for self-signed certs / CDN fronting)")
 	transportType := flag.String("transport", "tcp", "Transport: tcp or quic")
 	socksListen := flag.String("socks-listen", "127.0.0.1:1080", "SOCKS5 proxy listen address (host:port)")
 	logLevel := flag.String("log-level", "info", "Log level")
@@ -36,8 +41,8 @@ func main() {
 
 	logger := observability.NewLogger(*logLevel, "json")
 
-	if *serverAddr == "" {
-		logger.Error("--server is required")
+	if *serverAddr == "" && *wsURL == "" {
+		logger.Error("--server or --ws is required")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -46,11 +51,18 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+	if *injectTLS && *injectMethod == "keepalive" {
+		logger.Error("--inject-tls cannot be used with --inject-method keepalive")
+		os.Exit(1)
+	}
 
 	logger.Info("FGXP client starting",
 		"server", *serverAddr,
+		"ws", *wsURL,
 		"transport", *transportType,
+		"fingerprint", *fingerprint,
 		"sni", *sni,
+		"host", *hostHeader,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -73,18 +85,23 @@ func main() {
 		transType = transport.TCP
 	}
 
+	insecureSkipVerify := *insecure
 	clt, err := client.NewClient(client.ClientOptions{
-		ServerAddr:    *serverAddr,
-		RealIP:        *realIP,
-		InjectHost:    *injectHost,
-		InjectMethod:  *injectMethod,
-		WSURL:         *wsURL,
-		TransportType: transType,
-		PSK:           []byte(*psk),
-		SNI:           *sni,
+		ServerAddr:         *serverAddr,
+		RealIP:             *realIP,
+		HostHeader:         *hostHeader,
+		InjectHost:         *injectHost,
+		InjectMethod:       *injectMethod,
+		ProxyAddr:          *proxyAddr,
+		InjectTLS:          *injectTLS,
+		WSURL:              *wsURL,
+		Fingerprint:        *fingerprint,
+		TransportType:      transType,
+		PSK:                []byte(*psk),
+		SNI:                *sni,
+		InsecureSkipVerify: &insecureSkipVerify,
 		TLSConfig: &tls.Config{
-			ServerName:         *sni,
-			InsecureSkipVerify: true, // Bypass verification for self-signed certificates in local tests
+			InsecureSkipVerify: insecureSkipVerify,
 		},
 	})
 	if err != nil {

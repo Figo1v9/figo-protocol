@@ -79,3 +79,37 @@ func ParseTransportURL(raw string) (*ParsedTransportURL, error) {
 		IsTLS:        scheme == "https",
 	}, nil
 }
+
+// StripDefaultPort removes standard :80 (http) or :443 (https) from host:port
+// values while preserving non-standard ports and IPv6 brackets.
+func StripDefaultPort(host, scheme string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	h, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return host
+	}
+	if port == "" || (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		if strings.Contains(h, ":") {
+			return "[" + h + "]"
+		}
+		return h
+	}
+	return host
+}
+
+// NormalizeHTTPHost selects the HTTP Host header value from override or parsed
+// URL, omitting redundant default ports (:80 / :443).
+func NormalizeHTTPHost(parsed *ParsedTransportURL, override string) string {
+	scheme := "https"
+	if parsed != nil && parsed.Scheme != "" {
+		scheme = parsed.Scheme
+	}
+	candidate := strings.TrimSpace(override)
+	if candidate == "" && parsed != nil {
+		candidate = parsed.Host
+	}
+	return StripDefaultPort(candidate, scheme)
+}

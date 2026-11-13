@@ -5,6 +5,7 @@ package transport
 
 import (
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
@@ -84,36 +85,27 @@ func (s *ScrambleTransport) WrapConn(conn Conn) (Conn, error) {
 		key = []byte("fgxp-default-scramble-key-32b!")
 	}
 
-	// Derive 32-byte key and 16-byte IV from secret
+	// Derive 32-byte key from secret; per-connection 16-byte CSPRNG IVs are
+	// exchanged lazily on first Read/Write so synchronous net.Pipe() wrappers do
+	// not deadlock and distinct connections never reuse an AES-CTR keystream.
 	hash := sha256.Sum256(key)
-	cipherKey := hash[:]
+	cipherKey := make([]byte, sha256.Size)
+	copy(cipherKey, hash[:])
 
-	ivHash := sha256.Sum256(append(hash[:], []byte("iv-seed")...))
-	c2sIV := ivHash[:16]
-	s2cIV := ivHash[16:32]
-
-	var readIV, writeIV []byte
-	if s.IsServer {
-		readIV = c2sIV
-		writeIV = s2cIV
-	} else {
-		writeIV = c2sIV
-		readIV = s2cIV
+	var writeIV [16]byte
+	if _, err := rand.Read(writeIV[:]); err != nil {
+		return nil, fmt.Errorf("fgxp/transport: generate scramble IV: %w", err)
 	}
 
-	readStream, err := fgxpcrypto.CreateCTRStream(cipherKey, readIV)
-	if err != nil {
-		return nil, fmt.Errorf("fgxp/transport: create read cipher: %w", err)
-	}
-
-	writeStream, err := fgxpcrypto.CreateCTRStream(cipherKey, writeIV)
+	writeStream, err := fgxpcrypto.CreateCTRStream(cipherKey, writeIV[:])
 	if err != nil {
 		return nil, fmt.Errorf("fgxp/transport: create write cipher: %w", err)
 	}
 
 	return &scrambleConn{
 		Conn:        conn,
-		readStream:  readStream,
+		cipherKey:   cipherKey,
+		writeIV:     writeIV,
 		writeStream: writeStream,
 	}, nil
 }
@@ -122,6 +114,9 @@ type scrambleConn struct {
 	Conn
 	muRead      sync.Mutex
 	muWrite     sync.Mutex
+	cipherKey   []byte
+	writeIV     [16]byte
+	ivSent      bool
 	readStream  cipher.Stream
 	writeStream cipher.Stream
 }
@@ -129,6 +124,18 @@ type scrambleConn struct {
 func (c *scrambleConn) Read(b []byte) (int, error) {
 	c.muRead.Lock()
 	defer c.muRead.Unlock()
+
+	if c.readStream == nil {
+		var readIV [16]byte
+		if _, err := io.ReadFull(c.Conn, readIV[:]); err != nil {
+			return 0, err
+		}
+		stream, err := fgxpcrypto.CreateCTRStream(c.cipherKey, readIV[:])
+		if err != nil {
+			return 0, err
+		}
+		c.readStream = stream
+	}
 
 	n, err := c.Conn.Read(b)
 	if n > 0 {
@@ -140,6 +147,27 @@ func (c *scrambleConn) Read(b []byte) (int, error) {
 func (c *scrambleConn) Write(b []byte) (int, error) {
 	c.muWrite.Lock()
 	defer c.muWrite.Unlock()
+
+	if !c.ivSent {
+		out := make([]byte, len(c.writeIV)+len(b))
+		copy(out[:len(c.writeIV)], c.writeIV[:])
+		if len(b) > 0 {
+			c.writeStream.XORKeyStream(out[len(c.writeIV):], b)
+		}
+		for written := 0; written < len(out); {
+			n, err := c.Conn.Write(out[written:])
+			written += n
+			if err != nil {
+				if written <= len(c.writeIV) {
+					return 0, err
+				}
+				c.ivSent = true
+				return written - len(c.writeIV), err
+			}
+		}
+		c.ivSent = true
+		return len(b), nil
+	}
 
 	buf := make([]byte, len(b))
 	c.writeStream.XORKeyStream(buf, b)

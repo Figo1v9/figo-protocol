@@ -5,7 +5,6 @@ package server
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,10 +14,16 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +38,7 @@ import (
 	"github.com/figox/figox-protocol/pkg/stealth"
 	"github.com/figox/figox-protocol/pkg/stream"
 	"github.com/figox/figox-protocol/pkg/transport"
+	"github.com/gorilla/websocket"
 )
 
 // ServerOptions configures the FGXP server.
@@ -55,6 +61,12 @@ type Server struct {
 	pskStore      *auth.MemoryPSKStore
 	authenticator *auth.PSKAuthenticator
 	stealthEngine *stealth.Engine
+	reverseProxy  *httputil.ReverseProxy
+	httpListener  *chanListener
+	httpServer    *http.Server
+	wsUpgrader    websocket.Upgrader
+	wsPath        string
+	serverHeader  string
 
 	mu         sync.Mutex
 	listeners  []transport.Listener
@@ -88,6 +100,28 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		opts.Config = config.DefaultConfig()
 	}
 
+	switch opts.Config.Server.Transport {
+	case "", "tcp", "quic", "both", "ws":
+	default:
+		return nil, fmt.Errorf("fgxp/server: unsupported transport %q", opts.Config.Server.Transport)
+	}
+
+	wsPath := strings.TrimSpace(opts.Config.Server.WSPath)
+	if wsPath != "" {
+		if !strings.HasPrefix(wsPath, "/") {
+			return nil, fmt.Errorf("fgxp/server: server.ws_path must start with '/' (got %q)", wsPath)
+		}
+		if wsPath == "/" {
+			return nil, fmt.Errorf("fgxp/server: server.ws_path cannot be '/' (must be a secret path)")
+		}
+		if opts.Config.Stealth.Pluggable.Enabled {
+			return nil, fmt.Errorf("fgxp/server: stealth.pluggable cannot be enabled alongside HTTP/WS server mode (ws_path)")
+		}
+	}
+	if opts.Config.Server.Transport == "ws" && wsPath == "" {
+		return nil, fmt.Errorf("fgxp/server: server.ws_path is required when server.transport is 'ws'")
+	}
+
 	logger := observability.NewLogger(opts.Config.Observability.Logging.Level, opts.Config.Observability.Logging.Format)
 	metrics := observability.NewMetrics()
 	plugins := plugin.NewRegistry()
@@ -101,11 +135,16 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	authenticator := auth.NewPSKAuthenticator(pskStore)
-	stealthEngine := stealth.NewEngine(toStealthConfig(&opts.Config.Stealth))
+	stealthEngine := stealth.NewEngine(config.ToStealthConfig(&opts.Config.Stealth))
+
+	serverHeader := opts.Config.Stealth.Camouflage.ServerHeader
+	if serverHeader == "" {
+		serverHeader = stealth.DefaultServerHeader
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &Server{
+	srv := &Server{
 		opts:          opts,
 		logger:        logger,
 		metrics:       metrics,
@@ -113,37 +152,100 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		pskStore:      pskStore,
 		authenticator: authenticator,
 		stealthEngine: stealthEngine,
+		wsPath:        wsPath,
+		serverHeader:  serverHeader,
 		sessions:      make(map[string]*SessionContext),
 		ctx:           ctx,
 		cancel:        cancel,
-	}, nil
-}
-
-func toStealthConfig(cfg *config.StealthSection) *stealth.Config {
-	mode := stealth.CamouflageStatic
-	if cfg.Camouflage.Mode == "reverse_proxy" {
-		mode = stealth.CamouflageReverseProxy
-	} else if cfg.Camouflage.Mode == "none" {
-		mode = stealth.CamouflageNone
 	}
 
-	return &stealth.Config{
-		Padding: stealth.PaddingConfig{
-			Enabled: cfg.Padding.Enabled,
-			Mode:    cfg.Padding.Mode,
-			MinPad:  cfg.Padding.MinPad,
-			MaxPad:  cfg.Padding.MaxPad,
+	srv.initCamouflageAndWS()
+	return srv, nil
+}
+
+func (s *Server) handshakeTimeout() time.Duration {
+	if s.opts.Config != nil && s.opts.Config.Limits.HandshakeTimeout > 0 {
+		return s.opts.Config.Limits.HandshakeTimeout
+	}
+	return protocol.DefaultHandshakeTimeout
+}
+
+func (s *Server) idleTimeout() time.Duration {
+	if s.opts.Config != nil && s.opts.Config.Limits.IdleTimeout > 0 {
+		return s.opts.Config.Limits.IdleTimeout
+	}
+	return 5 * time.Minute
+}
+
+func (s *Server) initCamouflageAndWS() {
+	cfg := &s.opts.Config.Stealth.Camouflage
+	if cfg.Mode == "reverse_proxy" && cfg.ProxyTarget != "" {
+		targetURL, err := url.Parse(cfg.ProxyTarget)
+		if err != nil || targetURL.Host == "" {
+			s.logger.Error("invalid camouflage proxy target, falling back to static", "url", cfg.ProxyTarget, "error", err)
+		} else {
+			if targetURL.Scheme == "" {
+				targetURL.Scheme = "https"
+			}
+			rp := &httputil.ReverseProxy{
+				Rewrite: func(pr *httputil.ProxyRequest) {
+					pr.SetURL(targetURL)
+					pr.Out.Host = targetURL.Host
+					if pr.Out.Header.Get("User-Agent") == "" {
+						pr.Out.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+					}
+					pr.Out.Header.Del("Incap-Client-IP")
+					pr.Out.Header.Del("CF-Connecting-IP")
+					pr.Out.Header.Del("CF-IPCountry")
+				},
+				Transport: &http.Transport{
+					TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+					MaxIdleConnsPerHost:   32,
+					IdleConnTimeout:       60 * time.Second,
+					ResponseHeaderTimeout: 10 * time.Second,
+				},
+				ModifyResponse: func(resp *http.Response) error {
+					resp.Header.Set("Server", s.serverHeader)
+					return nil
+				},
+				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+					s.logger.Warn("camouflage proxy request failed, serving static decoy", "error", err)
+					s.serveStaticDecoyHTTP(w, r)
+				},
+			}
+			s.reverseProxy = rp
+		}
+	}
+
+	s.wsUpgrader = websocket.Upgrader{
+		EnableCompression: false,
+		CheckOrigin:       func(*http.Request) bool { return true },
+		Error: func(w http.ResponseWriter, r *http.Request, _ int, _ error) {
+			s.serveHTTPDecoy(w, r)
 		},
-		Timing: stealth.TimingConfig{
-			Enabled:   cfg.Timing.Enabled,
-			MaxJitter: time.Duration(cfg.Timing.JitterMS) * time.Millisecond,
-		},
-		Camouflage: stealth.CamouflageConfig{
-			Mode:         mode,
-			StaticDir:    cfg.Camouflage.StaticDir,
-			ProxyTarget:  cfg.Camouflage.ProxyTarget,
-			ServerHeader: cfg.Camouflage.ServerHeader,
-		},
+	}
+
+	if s.wsPath != "" {
+		s.httpListener = newChanListener()
+		s.httpServer = &http.Server{
+			Handler:           http.HandlerFunc(s.serveWSOrDecoyHTTP),
+			ReadHeaderTimeout: s.handshakeTimeout(),
+			IdleTimeout:       s.idleTimeout(),
+			ErrorLog:          log.New(io.Discard, "", 0),
+			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+				if hc, ok := c.(*httpCandidateConn); ok {
+					return context.WithValue(ctx, httpCandidateCtxKey{}, hc)
+				}
+				return ctx
+			},
+			ConnState: func(c net.Conn, state http.ConnState) {
+				if state == http.StateClosed || state == http.StateHijacked {
+					if hc, ok := c.(*httpCandidateConn); ok {
+						hc.notifyState(state)
+					}
+				}
+			},
+		}
 	}
 }
 
@@ -164,7 +266,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	var listeners []transport.Listener
 
-	// Listen on TCP
+	// Listen on TCP (includes "ws" WebSocket-over-HTTP/HTTPS mode)
 	if s.opts.TransportType == transport.TCP || s.opts.TransportType == transport.Both {
 		var l transport.Listener
 		var err error
@@ -178,9 +280,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		}
 		listeners = append(listeners, l)
 		if tlsCfg != nil {
-			s.logger.Info("Listening on TCP+TLS", "addr", s.opts.ListenAddr)
+			s.logger.Info("Listening on TCP+TLS", "addr", s.opts.ListenAddr, "ws_path", s.wsPath)
 		} else {
-			s.logger.Info("Listening on Raw TCP (HTTP Framing)", "addr", s.opts.ListenAddr)
+			s.logger.Info("Listening on Raw TCP (HTTP / WS)", "addr", s.opts.ListenAddr, "ws_path", s.wsPath)
 		}
 	}
 
@@ -196,6 +298,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		}
 		listeners = append(listeners, l)
 		s.logger.Info("Listening on QUIC (HTTP/3 Mimicry)", "addr", s.opts.ListenAddr)
+	}
+
+	if s.httpServer != nil && s.httpListener != nil {
+		go func() {
+			_ = s.httpServer.Serve(s.httpListener)
+		}()
 	}
 
 	s.mu.Lock()
@@ -215,9 +323,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return nil
 }
 
-// Close stops the server and closes all listeners and active sessions.
+// Close stops the server and closes all listeners, HTTP keep-alive servers, and active sessions.
 func (s *Server) Close() error {
 	s.cancel()
+
+	if s.httpServer != nil {
+		_ = s.httpServer.Close()
+	}
+	if s.httpListener != nil {
+		_ = s.httpListener.Close()
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -273,7 +388,7 @@ func generateEphemeralCert() (tls.Certificate, error) {
 }
 
 func (s *Server) loadTLSConfig() (*tls.Config, error) {
-	if s.opts.NoTLS {
+	if s.opts.NoTLS || (s.opts.Config != nil && s.opts.Config.Server.NoTLS) {
 		return nil, nil
 	}
 	var cert tls.Certificate
@@ -323,6 +438,10 @@ type connReadWriter struct {
 	conn transport.Conn
 }
 
+func (crw *connReadWriter) SetDeadline(t time.Time) error {
+	return crw.conn.SetDeadline(t)
+}
+
 func (crw *connReadWriter) ReadFrame() (*protocol.Frame, error) {
 	return protocol.DecodeFrame(crw.conn)
 }
@@ -344,8 +463,8 @@ func (s *Server) handleConnection(conn transport.Conn) {
 	s.metrics.ActiveConnections.Add(1)
 	defer s.metrics.ActiveConnections.Add(-1)
 
-	// Apply Stage 5 Pluggable Transport obfuscation wrapper if enabled
-	if s.opts.Config != nil && s.opts.Config.Stealth.Pluggable.Enabled {
+	// Legacy direct-TCP pluggable transport scrambling (forbidden alongside ws_path in NewServer).
+	if s.wsPath == "" && s.opts.Config != nil && s.opts.Config.Stealth.Pluggable.Enabled {
 		ptName := s.opts.Config.Stealth.Pluggable.Name
 		if ptName == "" {
 			ptName = "scramble"
@@ -361,44 +480,91 @@ func (s *Server) handleConnection(conn transport.Conn) {
 		}
 	}
 
-	// Check for L7 HTTP Handshake Framing (e.g. GET /download?... HTTP/1.1)
-	if framedConn, err := transport.HandleHTTPFramingServer(conn); err == nil && framedConn != nil {
-		conn = framedConn
+	if conn.TransportType() == transport.QUIC {
+		s.authenticateAndServe(conn)
+		return
 	}
 
-	// If TCP, perform active probe resistance. A legitimate FGXP client
-	// starts the TLS handshake immediately; a passive/active DPI probe that
-	// opens a TCP connection but never starts a recognizable TLS ClientHello
-	// (or sends a plaintext HTTP probe) must be routed to camouflage and
-	// never reveals any FGXP behavior.
-	if conn.TransportType() == transport.TCP {
-		peekable := newPeekConn(conn)
-		firstByte, err := peekable.PeekFirstByte()
-		if err != nil {
-			// No data arrived in time, or the connection was a bare TCP
-			// probe. Fail-closed: do not proceed with FGXP handling.
-			s.logger.Debug("no recognizable first byte; closing as probe", "error", err)
+	_ = conn.SetReadDeadline(time.Now().Add(s.handshakeTimeout()))
+	peekable := newPeekConn(conn)
+	firstByte, err := peekable.PeekFirstByte()
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		s.logger.Debug("no recognizable first byte; closing as probe", "error", err)
+		conn.Close()
+		return
+	}
+
+	if auth.IsFirstByteFGXP(firstByte) {
+		s.authenticateAndServe(peekable)
+		return
+	}
+
+	// Modern CDN / RFC 6455 WebSocket + keep-alive decoy mode.
+	if s.wsPath != "" {
+		if !stealth.IsHTTPMethodByte(firstByte) {
+			s.logger.Debug("non-HTTP garbage byte dropped silently", "remote", conn.RemoteAddr().String())
 			conn.Close()
 			return
 		}
 
-		if !auth.IsFirstByteFGXP(firstByte) {
-			s.logger.Info("non-FGXP traffic detected, routing to camouflage server", "remote", conn.RemoteAddr().String())
-			s.handleCamouflage(peekable)
+		hc := newHTTPCandidateConn(peekable, conn.ConnectionState())
+		if !s.httpListener.Enqueue(s.ctx, hc) {
+			_ = peekable.Close()
 			return
 		}
 
-		conn = peekable
+		var finalState http.ConnState
+		select {
+		case finalState = <-hc.stateCh:
+		case <-s.ctx.Done():
+			_ = peekable.Close()
+			return
+		}
+
+		if finalState != http.StateHijacked {
+			return // net/http.Server owns closing non-hijacked HTTP connections.
+		}
+
+		select {
+		case ws := <-hc.wsCh:
+			if ws == nil {
+				return
+			}
+			wsConn := transport.WrapWebSocketConn(ws, hc.RemoteAddr(), hc.tlsState)
+			s.authenticateAndServe(wsConn)
+		case <-s.ctx.Done():
+			return
+		}
+		return
 	}
 
-	// Step 1: Authenticate the connection. If the handshake/authentication
-	// fails for any reason, the connection is closed immediately without
-	// emitting FGXP-specific framing toward a potential prober.
-	crw := &connReadWriter{conn: conn}
-	authCtx, authCancel := context.WithTimeout(s.ctx, protocol.DefaultHandshakeTimeout)
-	defer authCancel()
+	// Legacy direct mode (no ws_path configured): allow optional L7 HTTP Upgrade
+	// framing and route regular HTTP probes to camouflage.
+	_ = peekable.SetReadDeadline(time.Now().Add(s.handshakeTimeout()))
+	framedConn, upgraded, err := transport.HandleHTTPFramingServer(peekable)
+	_ = peekable.SetReadDeadline(time.Time{})
+	if err != nil {
+		s.logger.Debug("invalid legacy http framing probe; closing", "error", err)
+		conn.Close()
+		return
+	}
+	if upgraded {
+		s.authenticateAndServe(framedConn)
+		return
+	}
 
+	s.logger.Info("non-FGXP traffic detected, routing to camouflage server", "remote", conn.RemoteAddr().String())
+	s.handleCamouflage(newPeekConn(framedConn))
+}
+
+func (s *Server) authenticateAndServe(conn transport.Conn) {
+	// Step 1: Authenticate the connection under HandshakeTimeout. Any auth error
+	// closes silently without emitting FGXP-specific hints.
+	crw := &connReadWriter{conn: conn}
+	authCtx, authCancel := context.WithTimeout(s.ctx, s.handshakeTimeout())
 	authRes, err := s.authenticator.Authenticate(authCtx, crw)
+	authCancel()
 	if err != nil || !authRes.Success {
 		s.metrics.AuthFailures.Add(1)
 		s.logger.Warn("authentication failed", "error", err, "reason", authRes.ErrorMessage)
@@ -661,77 +827,90 @@ type writeResult struct {
 	err error
 }
 
-func (s *Server) handleCamouflage(conn *peekConn) {
-	defer conn.Close()
-
-	cfg := &s.opts.Config.Stealth.Camouflage
-	if cfg.Mode == "reverse_proxy" && cfg.ProxyTarget != "" {
-		targetURL, err := url.Parse(cfg.ProxyTarget)
-		if err != nil {
-			s.logger.Error("invalid camouflage proxy target", "url", cfg.ProxyTarget, "error", err)
-			s.serveStaticCamouflage(conn)
-			return
+func (s *Server) extractClientIP(r *http.Request, fallback net.Addr) string {
+	if s.opts.Config != nil && s.opts.Config.Server.BehindCDN {
+		if ip := strings.TrimSpace(r.Header.Get("Incap-Client-IP")); ip != "" {
+			return ip
 		}
-
-		req, err := http.ReadRequest(conn.reader)
-		if err != nil {
-			return
+		if ip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); ip != "" {
+			return ip
 		}
-		defer req.Body.Close()
-
-		req.RequestURI = ""
-		req.URL.Scheme = targetURL.Scheme
-		req.URL.Host = targetURL.Host
-		if req.URL.Scheme == "" {
-			req.URL.Scheme = "http"
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			first, _, _ := strings.Cut(xff, ",")
+			if ip := strings.TrimSpace(first); ip != "" {
+				return ip
+			}
 		}
-		req.Host = targetURL.Host
-		req.Header.Set("Host", targetURL.Host)
-
-		client := &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-			Timeout: 10 * time.Second,
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			s.logger.Error("camouflage proxy request failed", "error", err)
-			return
-		}
-		defer resp.Body.Close()
-
-		serverHeader := cfg.ServerHeader
-		if serverHeader == "" {
-			serverHeader = "nginx/1.25.3"
-		}
-		resp.Header.Set("Server", serverHeader)
-		resp.Header.Set("Connection", "close")
-		resp.Close = true
-
-		_ = resp.Write(conn)
-		return
 	}
-
-	s.serveStaticCamouflage(conn)
+	if fallback != nil {
+		return fallback.String()
+	}
+	return ""
 }
 
-func (s *Server) serveStaticCamouflage(conn net.Conn) {
-	cfg := &s.opts.Config.Stealth.Camouflage
-	serverHeader := cfg.ServerHeader
-	if serverHeader == "" {
-		serverHeader = "nginx/1.25.3"
-	}
-
-	reader := bufio.NewReader(conn)
-	req, err := http.ReadRequest(reader)
-	if err != nil {
+func (s *Server) serveWSOrDecoyHTTP(w http.ResponseWriter, r *http.Request) {
+	hc, _ := r.Context().Value(httpCandidateCtxKey{}).(*httpCandidateConn)
+	if hc == nil || s.wsPath == "" || r.URL.Path != s.wsPath || !transport.IsWebSocketUpgradeRequest(r) {
+		s.serveHTTPDecoy(w, r)
 		return
 	}
-	defer req.Body.Close()
 
-	html := `<!DOCTYPE html>
+	clientIP := s.extractClientIP(r, hc.RemoteAddr())
+	s.logger.Debug("upgrading incoming websocket session", "client_ip", clientIP, "path", r.URL.Path)
+
+	respHdr := make(http.Header)
+	respHdr.Set("Server", s.serverHeader)
+
+	ws, err := s.wsUpgrader.Upgrade(w, r, respHdr)
+	if err != nil {
+		select {
+		case hc.wsCh <- nil:
+		default:
+		}
+		return
+	}
+	hc.wsCh <- ws
+}
+
+func (s *Server) serveHTTPDecoy(w http.ResponseWriter, r *http.Request) {
+	if s.opts.Config != nil && s.opts.Config.Stealth.Camouflage.Mode == "none" {
+		if hijacker, ok := w.(http.Hijacker); ok {
+			if raw, _, err := hijacker.Hijack(); err == nil {
+				_ = raw.Close()
+				return
+			}
+		}
+		w.Header().Set("Server", s.serverHeader)
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	if s.reverseProxy != nil {
+		s.reverseProxy.ServeHTTP(w, r)
+		return
+	}
+	s.serveStaticDecoyHTTP(w, r)
+}
+
+func (s *Server) serveStaticDecoyHTTP(w http.ResponseWriter, r *http.Request) {
+	var body []byte
+	if s.opts.Config != nil && s.opts.Config.Stealth.Camouflage.StaticDir != "" {
+		cleanPath := filepath.Clean("/" + r.URL.Path)
+		if cleanPath == "/" {
+			cleanPath = "/index.html"
+		}
+		candidate := filepath.Join(s.opts.Config.Stealth.Camouflage.StaticDir, cleanPath)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			if data, readErr := os.ReadFile(candidate); readErr == nil {
+				body = data
+			}
+		} else if fallbackData, readErr := os.ReadFile(filepath.Join(s.opts.Config.Stealth.Camouflage.StaticDir, "index.html")); readErr == nil {
+			body = fallbackData
+		}
+	}
+
+	if len(body) == 0 {
+		body = []byte(`<!DOCTYPE html>
 <html>
 <head>
 <title>Welcome to nginx!</title>
@@ -744,30 +923,58 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
 <h1>Welcome to nginx!</h1>
 <p>If you see this page, the nginx web server is successfully installed and working.</p>
 </body>
-</html>`
-
-	resp := &http.Response{
-		StatusCode:    http.StatusOK,
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		Header:         make(http.Header),
-		Body:          io.NopCloser(bytes.NewReader([]byte(html))),
-		ContentLength: int64(len(html)),
+</html>`)
 	}
-	resp.Header.Set("Server", serverHeader)
-	resp.Header.Set("Content-Type", "text/html; charset=utf-8")
-	resp.Header.Set("Connection", "close")
 
+	w.Header().Set("Server", s.serverHeader)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func (s *Server) handleCamouflage(conn *peekConn) {
+	defer conn.Close()
+
+	if s.opts.Config != nil && s.opts.Config.Stealth.Camouflage.Mode == "none" {
+		return
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(s.handshakeTimeout()))
+	req, err := http.ReadRequest(conn.reader)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return
+	}
+	defer req.Body.Close()
+
+	rec := httptest.NewRecorder()
+	s.serveHTTPDecoy(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	resp.Request = req
+	if resp.ContentLength < 0 && len(resp.TransferEncoding) == 0 {
+		resp.ContentLength = int64(rec.Body.Len())
+	}
+	resp.Header.Set("Server", s.serverHeader)
+	resp.Header.Set("Connection", "close")
+	resp.Close = true
 	_ = resp.Write(conn)
 }
 
-// peekConn wraps a net.Conn with a bufio.Reader to peek at the first byte.
+// peekConn wraps a transport.Conn with a bufio.Reader to peek at the first byte.
 type peekConn struct {
 	transport.Conn
 	reader *bufio.Reader
 }
 
 func newPeekConn(c transport.Conn) *peekConn {
+	if existing, ok := c.(*peekConn); ok {
+		return existing
+	}
+	if buffered, ok := c.(*transport.BufferedTransportConn); ok {
+		return &peekConn{Conn: buffered.Conn, reader: buffered.Reader()}
+	}
 	return &peekConn{
 		Conn:   c,
 		reader: bufio.NewReader(c),
@@ -786,25 +993,82 @@ func (c *peekConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
 
-// singleConnListener wraps a net.Conn to implement net.Listener for a single request.
-type singleConnListener struct {
-	conn net.Conn
-	once sync.Once
+type httpCandidateCtxKey struct{}
+
+type httpCandidateConn struct {
+	*peekConn
+	tlsState  tls.ConnectionState
+	stateOnce sync.Once
+	stateCh   chan http.ConnState
+	wsCh      chan *websocket.Conn
 }
 
-func (s *singleConnListener) Accept() (net.Conn, error) {
-	var c net.Conn
-	s.once.Do(func() {
-		c = s.conn
-	})
-	if c == nil {
-		return nil, io.EOF
+func newHTTPCandidateConn(c *peekConn, tlsState tls.ConnectionState) *httpCandidateConn {
+	return &httpCandidateConn{
+		peekConn: c,
+		tlsState: tlsState,
+		stateCh:  make(chan http.ConnState, 1),
+		wsCh:     make(chan *websocket.Conn, 1),
 	}
-	return c, nil
 }
 
-func (s *singleConnListener) Close() error   { return nil }
-func (s *singleConnListener) Addr() net.Addr { return s.conn.LocalAddr() }
+func (c *httpCandidateConn) notifyState(state http.ConnState) {
+	c.stateOnce.Do(func() {
+		c.stateCh <- state
+	})
+}
+
+type chanListener struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newChanListener() *chanListener {
+	return &chanListener{
+		conns:  make(chan net.Conn, 256),
+		closed: make(chan struct{}),
+	}
+}
+
+func (l *chanListener) Enqueue(ctx context.Context, c net.Conn) bool {
+	select {
+	case <-l.closed:
+		return false
+	case <-ctx.Done():
+		return false
+	case l.conns <- c:
+		return true
+	}
+}
+
+func (l *chanListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *chanListener) Close() error {
+	l.once.Do(func() {
+		close(l.closed)
+		for {
+			select {
+			case c := <-l.conns:
+				_ = c.Close()
+			default:
+				return
+			}
+		}
+	})
+	return nil
+}
+
+func (l *chanListener) Addr() net.Addr {
+	return &net.TCPAddr{}
+}
 
 // Start starts the session writer loop.
 func (sw *SessionWriter) Start() {

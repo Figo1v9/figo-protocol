@@ -21,6 +21,10 @@ curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/i
   ```bash
   curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --domain vpn.yourdomain.com
   ```
+- **بنمط CDN WebSocket (`--mode ws`) للربط عبر Cloudflare CDN أو Imperva CDN:**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --mode ws --domain vpn.yourdomain.com
+  ```
 - **بنمط `--no-tls` على بورت `80` (Cloudflare Worker / HTTP Inject):**
   ```bash
   curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --no-tls --sni www.cloudflare.com
@@ -112,16 +116,33 @@ go build -o bin/fgxp-client.exe ./cmd/fgxp-client
 ### 2️⃣ تشغيل العميل حسب حالة الاتصال والشبكة
 
 #### 🔹 الحالة (أ): الاتصال بهوست مجاني عادي `http://` (على البورت 80)
+يُرسل ترويسة HTTP `Host` نظيفة (مثلاً `http://safaricom.com` أو `http://digital.gov.eg/`):
 ```powershell
-.\bin\fgxp-client.exe --server YOUR_VPS_IP:80 --psk "my-secure-shared-key-32bytes" --sni "http://digital.gov.eg/" --socks-listen 127.0.0.1:1081
+.\bin\fgxp-client.exe --server YOUR_VPS_IP:80 --psk "my-secure-shared-key-32bytes" --sni "http://safaricom.com" --socks-listen 127.0.0.1:1081
 ```
+*(يمكن أيضاً استخدام `--inject` مع بروكسي الشبكة عبر `--proxy 10.x.x.x:8080 --inject safaricom.com --inject-method front` أو `connect`).*
 
-#### 🔹 الحالة (ب): الاتصال بهوست مشفر `https://` (على البورت 443)
+#### 🔹 الحالة (ب): الاتصال عبر CDN WebSocket (`ws` / `wss`) خلف Cloudflare أو Imperva CDN
+شغّل السيرفر بالسكربت التلقائي بوضع `--mode ws` (أو مرّر `--ws-path /ws-secret --behind-cdn` لـ `fgxp-server`) ثم اتصل من العميل هكذا:
+```powershell
+# اتصال مباشر أو عبر دومينك على Cloudflare / Imperva CDN
+.\bin\fgxp-client.exe --ws "wss://YOUR-CDN-DOMAIN/ws-secret" --psk "my-secure-shared-key-32bytes" --sni "safaricom.com" --host "YOUR-CDN-DOMAIN" --socks-listen 127.0.0.1:1081
+
+# أو تحديد IP حافة الـ CDN يدوياً (مثل Cloudflare Worker أو Edge IP)
+.\bin\fgxp-client.exe --ws "wss://YOUR-CDN-DOMAIN/ws-secret" --real-ip "104.16.132.229:443" --psk "my-secure-shared-key-32bytes" --host "YOUR-CDN-DOMAIN" --sni "safaricom.com" --socks-listen 127.0.0.1:1081
+```
+> **تنبيه صريح بخصوص `http://safaricom.com` وشبكات Imperva:**
+> دومين `safaricom.com` يعمل على شبكة Imperva (`AS19551`). إذا كانت شبكة الموبايل عندك تسمح فقط بـ IP حافة Imperva وترفض الـ VPS المباشر:
+> 1. لا يمكن لأي كود داخل السيرفر انتحال IP شبكة Imperva على الإنترنت العام.
+> 2. لو الفحص يعتمد على ترويسة `Host` أو `SNI` فقط: استخدم `--no-tls` + `--sni "http://safaricom.com"` أو `--ws` مع `--sni "safaricom.com"`.
+> 3. لو الفحص يحظر أي IP خارج CDN: اربط دومينك على Cloudflare (أو Worker مجاني من `configs/cloudflare_worker_relay.js`) أو على Imperva إذا كان لديك حساب موثق عليه.
+
+#### 🔹 الحالة (جـ): الاتصال بهوست مشفر `https://` (على البورت 443)
 ```powershell
 .\bin\fgxp-client.exe --server YOUR_VPS_IP:443 --psk "my-secure-shared-key-32bytes" --sni "https://artistudio.fun/download?nocache=123" --socks-listen 127.0.0.1:1081
 ```
 
-#### 🔹 الحالة (جـ): الاتصال المتقدم بتقنية الـ Domain Fronting (`--real-ip`)
+#### 🔹 الحالة (د): الاتصال المتقدم بتقنية الـ Domain Fronting (`--real-ip`)
 استخدم هذه الطريقة لو كنت ترغب بتوجيه الاتصال لـ IP سيرفرك مباشرة مع الحفاظ على الـ SNI النظيف المسموح للشبكة:
 ```powershell
 .\bin\fgxp-client.exe --server "whitelisted-domain.com:443" --real-ip "YOUR_VPS_IP:443" --psk "my-secure-shared-key-32bytes" --sni "https://whitelisted-domain.com/download?nocache=123" --socks-listen 127.0.0.1:1081

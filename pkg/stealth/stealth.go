@@ -63,6 +63,9 @@ const (
 	CamouflageReverseProxy
 )
 
+// DefaultServerHeader is the fallback HTTP Server header emitted by camouflage and WS responses.
+const DefaultServerHeader = "nginx/1.25.3"
+
 // CamouflageConfig configures the fallback handler for non-FGXP connections.
 type CamouflageConfig struct {
 	// Mode selects the camouflage strategy.
@@ -93,7 +96,7 @@ func DefaultConfig() *Config {
 		},
 		Camouflage: CamouflageConfig{
 			Mode:         CamouflageStatic,
-			ServerHeader: "nginx/1.25.3",
+			ServerHeader: DefaultServerHeader,
 		},
 	}
 }

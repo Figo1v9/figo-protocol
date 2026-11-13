@@ -31,10 +31,17 @@ func main() {
 	listenAddr := flag.String("listen", ":443", "Listen address")
 	certPath := flag.String("cert", "", "TLS certificate file")
 	keyPath := flag.String("key", "", "TLS private key file")
-	noTLS := flag.Bool("no-tls", false, "Disable TLS for plaintext HTTP framing (port 80)")
+	noTLS := flag.Bool("no-tls", false, "Disable TLS for plaintext HTTP / WS mode (port 80)")
+	wsPath := flag.String("ws-path", "", "Secret RFC 6455 WebSocket path (e.g. /ws-secret)")
+	behindCDN := flag.Bool("behind-cdn", false, "Log visitor IP from CDN headers (Incap-Client-IP / CF-Connecting-IP / X-Forwarded-For)")
 	psk := flag.String("psk", "", "Pre-shared key for authentication")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flag.Parse()
+
+	explicitFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
 
 	logger := observability.NewLogger(*logLevel, "json")
 	metrics := observability.NewMetrics()
@@ -49,10 +56,40 @@ func main() {
 			logger.Error("failed to load config", "path", *configPath, "error", err)
 			os.Exit(1)
 		}
+		if explicitFlags["listen"] {
+			cfg.Server.Listen = *listenAddr
+		}
+		if explicitFlags["cert"] {
+			cfg.TLS.Cert = *certPath
+		}
+		if explicitFlags["key"] {
+			cfg.TLS.Key = *keyPath
+		}
+		if explicitFlags["no-tls"] {
+			cfg.Server.NoTLS = *noTLS
+		}
+		if explicitFlags["ws-path"] {
+			cfg.Server.WSPath = *wsPath
+			if *wsPath != "" {
+				cfg.Server.Transport = "ws"
+			}
+		}
+		if explicitFlags["behind-cdn"] {
+			cfg.Server.BehindCDN = *behindCDN
+		}
+		if explicitFlags["psk"] {
+			cfg.Auth.Keys = []config.KeyConfig{{ID: "default", Secret: *psk}}
+		}
 	} else {
 		cfg = config.DefaultConfig()
 		cfg.Server.Listen = *listenAddr
 		cfg.Server.Transport = "tcp"
+		cfg.Server.NoTLS = *noTLS
+		cfg.Server.WSPath = *wsPath
+		cfg.Server.BehindCDN = *behindCDN
+		if *wsPath != "" {
+			cfg.Server.Transport = "ws"
+		}
 		cfg.TLS.Cert = *certPath
 		cfg.TLS.Key = *keyPath
 		cfg.Auth.Method = "psk"
@@ -64,6 +101,8 @@ func main() {
 	logger.Info("FGXP server starting",
 		"listen", cfg.Server.Listen,
 		"transport", cfg.Server.Transport,
+		"no_tls", cfg.Server.NoTLS,
+		"ws_path", cfg.Server.WSPath,
 	)
 
 	// Setup graceful shutdown.
@@ -88,6 +127,8 @@ func main() {
 		transType = transport.QUIC
 	case "both":
 		transType = transport.Both
+	case "ws", "tcp", "":
+		transType = transport.TCP
 	default:
 		transType = transport.TCP
 	}
@@ -102,7 +143,7 @@ func main() {
 		TransportType: transType,
 		TLSCertFile:   cfg.TLS.Cert,
 		TLSKeyFile:    cfg.TLS.Key,
-		NoTLS:         *noTLS,
+		NoTLS:         cfg.Server.NoTLS,
 		PSK:           keyBytes,
 		Config:        cfg,
 	})
@@ -121,8 +162,8 @@ func main() {
 		}
 		targetAddr := string(bytes.TrimSpace(targetAddrBytes))
 
-		// Dial target host over IPv4
-		targetConn, err := net.DialTimeout("tcp4", targetAddr, 10*time.Second)
+		// Dial target host over TCP (supports IPv4 & IPv6)
+		targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 		if err != nil {
 			logger.Error("failed to dial target host", "host", targetAddr, "error", err)
 			return

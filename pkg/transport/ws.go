@@ -1,48 +1,85 @@
 // Package transport provides the Layer 1 abstraction for FGXP.
-// ws.go implements a WebSocket transport layer that wraps FGXP binary frames
-// inside standard RFC 6455 WebSocket messages. This enables relay through
-// Cloudflare Workers, CDN edge nodes, and any WebSocket-compatible proxy.
-//
-// Architecture:
-//   Client --[WebSocket over TLS 1.3]--> Cloudflare Worker --[raw TCP]--> VPS FGXP Server
-//
-// The Cloudflare Worker accepts the WebSocket connection and relays binary
-// messages to/from the FGXP server over a raw TCP socket. Because the outer
-// layer is a standard WebSocket connection to a Cloudflare domain, ISP
-// transparent proxies see legitimate Cloudflare traffic and allow it through.
+// ws.go implements bidirectional RFC 6455 WebSocket transport with browser uTLS
+// mimicry (client) and probe-safe HTTP upgrade validation (server), supporting
+// Imperva, Cloudflare, Nginx, and Cloudflare Worker relays.
 package transport
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+const defaultWSPingTimeout = 10 * time.Second
+
 // wsConn wraps a gorilla/websocket.Conn to implement the transport.Conn interface.
-// It presents a stream-oriented interface (Read/Write) on top of WebSocket's
-// message-oriented protocol by buffering incoming messages.
+// Writes and write-deadlines share c.mu because gorilla/websocket does not lock
+// around its internal writeDeadline field during concurrent WriteMessage calls.
 type wsConn struct {
-	ws     *websocket.Conn
-	mu     sync.Mutex
-	reader io.Reader // current message reader for partial reads
+	ws         *websocket.Conn
+	mu         sync.Mutex
+	reader     io.Reader
+	tlsState   tls.ConnectionState
+	remoteAddr net.Addr
+	stopOnce   sync.Once
+	stopCh     chan struct{}
 }
 
 var _ Conn = (*wsConn)(nil)
+
+// WrapWebSocketConn adapts a negotiated *websocket.Conn into a transport.Conn.
+func WrapWebSocketConn(ws *websocket.Conn, remoteAddr net.Addr, tlsState tls.ConnectionState) Conn {
+	if remoteAddr == nil && ws != nil {
+		remoteAddr = ws.RemoteAddr()
+	}
+	return &wsConn{
+		ws:         ws,
+		tlsState:   tlsState,
+		remoteAddr: remoteAddr,
+		stopCh:     make(chan struct{}),
+	}
+}
+
+// StartKeepAlive sends periodic RFC 6455 Ping control frames to keep CDN edges
+// (such as Imperva and Cloudflare) from reaping idle WebSocket tunnels.
+func (c *wsConn) StartKeepAlive(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-c.stopCh:
+				return
+			case <-ticker.C:
+				// gorilla/websocket permits concurrent WriteControl alongside WriteMessage.
+				if err := c.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(defaultWSPingTimeout)); err != nil {
+					_ = c.Close()
+					return
+				}
+			}
+		}
+	}()
+}
 
 func (c *wsConn) Read(b []byte) (int, error) {
 	for {
 		if c.reader != nil {
 			n, err := c.reader.Read(b)
 			if err == io.EOF {
-				// Current message fully consumed, get next message
 				c.reader = nil
 				if n > 0 {
 					return n, nil
@@ -51,7 +88,6 @@ func (c *wsConn) Read(b []byte) (int, error) {
 			}
 			return n, err
 		}
-		// Get next WebSocket message
 		_, reader, err := c.ws.NextReader()
 		if err != nil {
 			return 0, err
@@ -63,14 +99,18 @@ func (c *wsConn) Read(b []byte) (int, error) {
 func (c *wsConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	err := c.ws.WriteMessage(websocket.BinaryMessage, b)
-	if err != nil {
+	if err := c.ws.WriteMessage(websocket.BinaryMessage, b); err != nil {
 		return 0, err
 	}
 	return len(b), nil
 }
 
 func (c *wsConn) Close() error {
+	c.stopOnce.Do(func() {
+		if c.stopCh != nil {
+			close(c.stopCh)
+		}
+	})
 	return c.ws.Close()
 }
 
@@ -79,14 +119,17 @@ func (c *wsConn) LocalAddr() net.Addr {
 }
 
 func (c *wsConn) RemoteAddr() net.Addr {
+	if c.remoteAddr != nil {
+		return c.remoteAddr
+	}
 	return c.ws.RemoteAddr()
 }
 
 func (c *wsConn) SetDeadline(t time.Time) error {
-	if err := c.ws.SetReadDeadline(t); err != nil {
+	if err := c.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return c.ws.SetWriteDeadline(t)
+	return c.SetWriteDeadline(t)
 }
 
 func (c *wsConn) SetReadDeadline(t time.Time) error {
@@ -94,72 +137,150 @@ func (c *wsConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *wsConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.ws.SetWriteDeadline(t)
 }
 
 func (c *wsConn) ConnectionState() tls.ConnectionState {
-	return tls.ConnectionState{}
+	return c.tlsState
 }
 
 func (c *wsConn) TransportType() Type {
 	return TCP
 }
 
-// DialWebSocketOptions configures the WebSocket transport with CDN Fronting support.
-type DialWebSocketOptions struct {
-	WSURL      string // Worker URL (e.g. wss://my-vpn-relay.mohamedkhedr974.workers.dev)
-	SNI        string // TLS SNI for handshake spoofing (e.g. digital.gov.eg)
-	HostHeader string // HTTP Host header for Cloudflare routing (e.g. my-vpn-relay.mohamedkhedr974.workers.dev)
-	DialAddr   string // Optional target IP override to dial (e.g. Cloudflare IP 104.16.53.111)
+// IsWebSocketUpgradeRequest verifies RFC 6455 client upgrade preconditions
+// before calling gorilla/websocket.Upgrader so active HTTP probes never
+// receive gorilla/websocket's telltale 400/405 error responses.
+func IsWebSocketUpgradeRequest(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet || !r.ProtoAtLeast(1, 1) {
+		return false
+	}
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	if !headerContainsToken(r.Header.Values("Connection"), "upgrade") {
+		return false
+	}
+	if strings.TrimSpace(r.Header.Get("Sec-WebSocket-Version")) != "13" {
+		return false
+	}
+	rawKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(r.Header.Get("Sec-WebSocket-Key")))
+	return err == nil && len(rawKey) == 16
 }
 
-// DialWebSocket connects to a WebSocket endpoint (typically a Cloudflare Worker)
-// supporting full CDN Fronting (SNI spoofing + Worker routing).
+func headerContainsToken(values []string, target string) bool {
+	for _, val := range values {
+		for _, part := range strings.Split(val, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), target) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// DialWebSocketOptions configures the WebSocket transport with uTLS and CDN Fronting.
+type DialWebSocketOptions struct {
+	WSURL              string        // e.g. wss://cdn.example.com/ws-secret or ws://1.2.3.4/ws-secret
+	SNI                string        // TLS SNI for handshake mimicry/fronting
+	HostHeader         string        // HTTP Host header override (decoupled from SNI and DialAddr)
+	DialAddr           string        // Optional target IP[:port] override (e.g. Cloudflare/Imperva edge IP)
+	Fingerprint        string        // Browser TLS fingerprint: chrome, firefox, edge, randomized, none
+	InsecureSkipVerify bool          // Allow self-signed / mismatched SAN certificates
+	RootCAs            *x509.CertPool
+	PingInterval       time.Duration // RFC 6455 Ping interval (default 20s when > 0)
+}
+
+// DialWebSocket connects to an RFC 6455 WebSocket endpoint using uTLS (HTTP/1.1
+// ALPN) for wss:// and full CDN SNI/Host/IP decoupling.
 func DialWebSocket(ctx context.Context, opts DialWebSocketOptions) (Conn, error) {
-	u, err := url.Parse(opts.WSURL)
+	u, err := url.Parse(strings.TrimSpace(opts.WSURL))
 	if err != nil {
 		return nil, fmt.Errorf("parse ws url: %w", err)
 	}
-	if u.Scheme == "https" {
+	switch strings.ToLower(u.Scheme) {
+	case "https", "wss", "":
 		u.Scheme = "wss"
-	} else if u.Scheme == "http" {
+	case "http", "ws":
 		u.Scheme = "ws"
-	}
-	if u.Scheme != "ws" && u.Scheme != "wss" {
+	default:
 		u.Scheme = "wss"
 	}
 
-	// Default Host header to the URL host if not specified
-	hostHeader := opts.HostHeader
-	if hostHeader == "" {
-		hostHeader = u.Host
+	httpScheme := "https"
+	defaultPort := "443"
+	if u.Scheme == "ws" {
+		httpScheme = "http"
+		defaultPort = "80"
 	}
 
-	// Default SNI to HostHeader or URL host if not specified
-	sniHost := opts.SNI
-	if sniHost == "" {
+	hostHeader := strings.TrimSpace(opts.HostHeader)
+	if hostHeader == "" {
+		hostHeader = StripDefaultPort(u.Host, httpScheme)
+	} else {
+		hostHeader = StripDefaultPort(hostHeader, httpScheme)
+	}
+
+	sniHost := strings.TrimSpace(opts.SNI)
+	if sniHost != "" {
+		if parsed, parseErr := ParseTransportURL(sniHost); parseErr == nil {
+			sniHost = parsed.Hostname
+		}
+	} else {
 		sniHost = u.Hostname()
 	}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
-		TLSClientConfig: &tls.Config{
-			ServerName:         sniHost,
-			InsecureSkipVerify: true,
-		},
+	dialTarget := strings.TrimSpace(opts.DialAddr)
+	if dialTarget == "" {
+		dialTarget = EnsurePort(u.Host, defaultPort)
+	} else {
+		dialTarget = EnsurePort(dialTarget, defaultPort)
 	}
 
-	// Override NetDialContext if custom DialAddr or SNI is specified
-	if opts.DialAddr != "" {
-		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			netDialer := &net.Dialer{Timeout: 15 * time.Second}
-			return netDialer.DialContext(ctx, network, opts.DialAddr)
+	var negotiatedState tls.ConnectionState
+	var stateMu sync.Mutex
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+	}
+
+	if u.Scheme == "wss" {
+		tlsCfg := &tls.Config{
+			ServerName:         sniHost,
+			InsecureSkipVerify: opts.InsecureSkipVerify,
+			RootCAs:            opts.RootCAs,
+			NextProtos:         []string{"http/1.1"},
+		}
+		fp := opts.Fingerprint
+		if fp == "" {
+			fp = FingerprintChrome
+		}
+		dialer.NetDialTLSContext = func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+			conn, state, dialErr := DialUTLSHTTP1(dialCtx, dialTarget, tlsCfg, fp)
+			if dialErr != nil {
+				return nil, dialErr
+			}
+			stateMu.Lock()
+			negotiatedState = state
+			stateMu.Unlock()
+			return conn, nil
+		}
+	} else if opts.DialAddr != "" {
+		dialer.NetDialContext = func(dialCtx context.Context, _ string, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext(dialCtx, "tcp", dialTarget)
 		}
 	}
 
+	originHost := StripDefaultPort(hostHeader, httpScheme)
 	headers := http.Header{
-		"Host":       {hostHeader},
-		"User-Agent": {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
+		"Host":            {hostHeader},
+		"Origin":          {httpScheme + "://" + originHost},
+		"Accept-Language": {"en-US,en;q=0.9"},
+		"Cache-Control":   {"no-cache"},
+		"Pragma":          {"no-cache"},
+		"User-Agent":      {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
 	}
 
 	ws, _, err := dialer.DialContext(ctx, u.String(), headers)
@@ -167,8 +288,20 @@ func DialWebSocket(ctx context.Context, opts DialWebSocketOptions) (Conn, error)
 		return nil, fmt.Errorf("websocket dial %s: %w", u.String(), err)
 	}
 
-	// Set generous limits for FGXP traffic
 	ws.SetReadLimit(64 * 1024 * 1024) // 64MB max message
 
-	return &wsConn{ws: ws}, nil
+	stateMu.Lock()
+	stateCopy := negotiatedState
+	stateMu.Unlock()
+
+	wrapped := &wsConn{
+		ws:         ws,
+		tlsState:   stateCopy,
+		remoteAddr: ws.RemoteAddr(),
+		stopCh:     make(chan struct{}),
+	}
+	if opts.PingInterval > 0 {
+		wrapped.StartKeepAlive(opts.PingInterval)
+	}
+	return wrapped, nil
 }
