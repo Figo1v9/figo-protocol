@@ -1,10 +1,34 @@
 # 📖 دليل التشغيل السريع والأوامر الجاهزة — FigoX Protocol (FGXP v2)
 
-مستند إرشادي مخصص يحتوي على خطوات التشغيل التفصيلية للأوامر على كلٍّ من خادم الـ VPS (عبر الـ SSH) والجهاز المحلّي (عبر الـ Windows PowerShell).
+مستند إرشادي مخصص يحتوي على خطوات التثبيت التلقائي بسطر واحد على خادم Ubuntu/Debian Linux وأوامر التشغيل على كلٍّ من الـ VPS والجهاز المحلّي (Windows PowerShell).
 
 ---
 
-## ⚡ الـ Master Cheat Sheet (أمر سطر واحد لكل VPS جديد)
+## 🚀 التثبيت التلقائي الكامل بسطر واحد على Ubuntu / Debian (`systemd`)
+
+بدل البناء والرفع اليدوي، شغّل الأمر التالي مباشرةً داخل الـ VPS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash
+```
+
+**أمثلة سريعة لأهم الأوضاع:**
+- **بـ IP مباشر + SNI تمويه (`443`):**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --sni www.cloudflare.com
+  ```
+- **بدومين + Let's Encrypt TLS تلقائي (`443`):**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --domain vpn.yourdomain.com
+  ```
+- **بنمط `--no-tls` على بورت `80` (Cloudflare Worker / HTTP Inject):**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --no-tls --sni www.cloudflare.com
+  ```
+
+---
+
+## ⚡ الـ Master Cheat Sheet (النشر اليدوي لـ VPS جاهز)
 
 ### 1️⃣ أمر السيرفر على Google Cloud VPS SSH (بعد رفع `fgxp-server-linux`):
 ```bash

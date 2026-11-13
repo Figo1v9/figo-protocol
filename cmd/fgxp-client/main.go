@@ -205,15 +205,15 @@ func handleSOCKS5(conn net.Conn, clt *client.Client, logger *observability.Logge
 		return
 	}
 
-	// Pipe bidirectional stream with 128KB high-speed buffers
+	// Pipe bidirectional stream with 32KB buffers (stays safely under 64KB MaxPayloadLength after padding)
 	errCh := make(chan error, 2)
 	go func() {
-		buf := make([]byte, 128*1024)
+		buf := make([]byte, 32*1024)
 		_, err := io.CopyBuffer(st, conn, buf)
 		errCh <- err
 	}()
 	go func() {
-		buf := make([]byte, 128*1024)
+		buf := make([]byte, 32*1024)
 		_, err := io.CopyBuffer(conn, st, buf)
 		errCh <- err
 	}()

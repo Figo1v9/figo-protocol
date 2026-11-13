@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   fgxp-server:
     build:
@@ -12,7 +10,8 @@ services:
       - "443:443/udp"
     volumes:
       - ./configs/server.example.yaml:/etc/fgxp/server.yaml:ro
-      - ./certs:/etc/fgxp/certs:ro
+      - ./cert.pem:/etc/fgxp/cert.pem:ro
+      - ./key.pem:/etc/fgxp/key.pem:ro
     environment:
       - LOG_LEVEL=info
     command: ["--config", "/etc/fgxp/server.yaml"]
@@ -23,10 +22,11 @@ services:
       dockerfile: Dockerfile
     container_name: fgxp-client
     restart: always
+    entrypoint: ["/usr/local/bin/fgxp-client"]
     volumes:
       - ./configs/client.example.yaml:/etc/fgxp/client.yaml:ro
     environment:
       - LOG_LEVEL=info
-    command: ["/usr/local/bin/fgxp-client", "--server", "fgxp-server:443", "--psk", "BASE64_ENCODED_PSK_HERE", "--sni", "localhost"]
+    command: ["--server", "fgxp-server:443", "--psk", "CHANGE_ME_PSK", "--sni", "localhost"]
     depends_on:
       - fgxp-server

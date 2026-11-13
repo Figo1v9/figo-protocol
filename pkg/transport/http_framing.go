@@ -108,7 +108,7 @@ func HandleHTTPFramingServer(conn Conn) (Conn, error) {
 	respBuf := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
-		"Server: FGXP/2.0\r\n\r\n"
+		"Server: nginx/1.25.3\r\n\r\n"
 
 	if _, err := conn.Write([]byte(respBuf)); err != nil {
 		return nil, fmt.Errorf("write http framing 101 response: %w", err)

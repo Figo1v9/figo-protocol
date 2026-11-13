@@ -9,10 +9,10 @@ server:
   transport: "tcp"
 
 tls:
-  # TLS certificate and key files (required).
+  # TLS certificate and key files (required unless running with --no-tls).
   cert: "/etc/fgxp/cert.pem"
   key: "/etc/fgxp/key.pem"
-  # Optional: ACME automatic certificate management.
+  # Optional placeholder (not yet auto-provisioned in Go; use deploy/install-ubuntu.sh with --domain for Certbot/Let's Encrypt).
   acme:
     enabled: false
     email: "admin@example.com"
@@ -41,16 +41,18 @@ stealth:
     min_pad: 0
     max_pad: 255
   timing:
-    # Enable inter-frame timing jitter.
+    # Enable inter-frame timing jitter (keep low, e.g. 2ms, to preserve throughput).
     enabled: true
-    jitter_ms: 50
+    jitter_ms: 2
   camouflage:
     # Mode: "static" or "reverse_proxy"
     mode: "reverse_proxy"
     # For static mode: directory of HTML files to serve.
     static_dir: "/var/www/camouflage"
-    # For reverse_proxy mode: backend URL.
-    proxy_target: "https://real-website.com"
+    # For reverse_proxy mode: backend URL (use a reliable, probe-friendly HTTPS origin).
+    proxy_target: "https://example.com"
+    # HTTP Server header returned in camouflage responses.
+    server_header: "nginx/1.25.3"
 
 streams:
   # Maximum concurrent streams per connection.
@@ -65,8 +67,8 @@ congestion:
   algorithm: "cubic"
 
 compression:
-  # Algorithm: none, lz4 (fast), or zstd (better ratio)
-  algorithm: "lz4"
+  # Algorithm: "none", "lz4", or "zstd". Keep "none" when using the fgxp-client CLI (it runs uncompressed).
+  algorithm: "none"
 
 limits:
   # Maximum total connections.
@@ -89,12 +91,12 @@ observability:
     # Format: json or text
     format: "json"
   tracing:
-    # OpenTelemetry tracing (v0.4.0)
+    # OpenTelemetry tracing (placeholder / not yet wired in server runtime)
     enabled: false
     endpoint: "http://localhost:4318"
 
 cluster:
-  # Multi-node clustering (v0.5.0)
+  # Multi-node clustering (placeholder / not yet wired in server runtime)
   enabled: false
   node_id: "node-1"
   peers:

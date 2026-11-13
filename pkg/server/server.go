@@ -295,7 +295,7 @@ func (s *Server) loadTLSConfig() (*tls.Config, error) {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h2", "http/1.1"},
+		NextProtos:   []string{"http/1.1"},
 	}, nil
 }
 
@@ -702,8 +702,13 @@ func (s *Server) handleCamouflage(conn *peekConn) {
 		}
 		defer resp.Body.Close()
 
-		resp.Header.Set("Server", cfg.ServerHeader)
+		serverHeader := cfg.ServerHeader
+		if serverHeader == "" {
+			serverHeader = "nginx/1.25.3"
+		}
+		resp.Header.Set("Server", serverHeader)
 		resp.Header.Set("Connection", "close")
+		resp.Close = true
 
 		_ = resp.Write(conn)
 		return

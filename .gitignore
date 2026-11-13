@@ -1,0 +1,11 @@
+# Local stray binaries and editor backups
+.kilo/
+bin/client
+bin/server
+*.exe~
+*.log
+.env
+coverage.out
+.DS_Store
+Thumbs.db
+

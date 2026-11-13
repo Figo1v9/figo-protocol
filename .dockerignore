@@ -1,0 +1,10 @@
+.git
+.kilo
+bin/
+scratch/
+*.exe
+*.exe~
+*.zip
+*.log
+.env
+

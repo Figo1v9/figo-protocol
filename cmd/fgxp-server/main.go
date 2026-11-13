@@ -129,15 +129,15 @@ func main() {
 		}
 		defer targetConn.Close()
 
-		// Pipe bidirectional stream with 128KB high-speed buffers
+		// Pipe bidirectional stream with 32KB buffers (stays safely under 64KB MaxPayloadLength after padding)
 		errCh := make(chan error, 2)
 		go func() {
-			buf := make([]byte, 128*1024)
+			buf := make([]byte, 32*1024)
 			_, err := io.CopyBuffer(targetConn, reader, buf) // copy remaining bytes from bufio reader first
 			errCh <- err
 		}()
 		go func() {
-			buf := make([]byte, 128*1024)
+			buf := make([]byte, 32*1024)
 			_, err := io.CopyBuffer(st, targetConn, buf)
 			errCh <- err
 		}()

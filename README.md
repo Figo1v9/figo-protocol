@@ -127,7 +127,35 @@ This project is licensed under the MIT License.
 
 ## دليل التشغيل والتجربة بالتفصيل (Arabic Guide)
 
-هذا الدليل يوضح خطوات بناء وتشغيل النفق، سواء كـ **تجربة محلية** للتحقق من سلامة الأكواد، أو كـ **نشر حقيقي** على خادم خارجي (VPS) لتجاوز الحجب وحماية الخصوصية### ثانياً: النشر والتشغيل الحقيقي (Real GCP Cloud Deployment)
+هذا الدليل يوضح خطوات بناء وتشغيل النفق، سواء بالتثبيت التلقائي الكامل بسطر واحد على خادم Ubuntu/Debian أو بالنشر اليدوي.
+
+### أولاً: التثبيت التلقائي بسطر واحد على أوبونتو / ديبيان (One-Command Ubuntu Installer)
+
+على أي خادم Ubuntu أو Debian جديد، شغّل هذا الأمر مرة واحدة فقط — هيقوم تلقائياً بتثبيت الاعتماديات وGo `1.26.5`، بناء المشروع، توليد الشهادات وPSK عشوائي، ضبط BBR وجدار الحماية UFW، وتشغيل الخدمة عبر `systemd`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash
+```
+
+**أوضاع التثبيت مع SNI:**
+
+1. **باستخدام IP مباشر + SNI تمويه (بورت `443` — بدون دومين):**
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --sni www.cloudflare.com
+   ```
+2. **باستخدام دومين خاص + شهادة Let's Encrypt تلقائية (أقوى تخفّي):**
+   *(تأكد أولاً إن سجل DNS من نوع `A` للدومين بيشير لـ IP السيرفر، وإن بورت `80` و `443` مفتوحين في Cloud Firewall)*
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --domain vpn.yourdomain.com --email you@example.com
+   ```
+3. **بدون TLS (`--no-tls` على بورت `80`) لربط Cloudflare Worker Relay أو HTTP Injection:**
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Figo1v9/figo-protocol/main/deploy/install-ubuntu.sh | sudo bash -s -- --no-tls --sni www.cloudflare.com
+   ```
+
+بعد انتهاء التثبيت هتلاقي أمر العميل الجاهز على الشاشة ومحفوظ في `/etc/fgxp/client-info.txt`. ولأغراض الإنتاج، غيّر الشهادات التجريبية الافتراضية في الجذر (`cert.pem` / `key.pem`) دائماً ولا تشارك الـ PSK علناً.
+
+### ثانياً: النشر والتشغيل الحقيقي (Manual GCP Cloud Deployment)
 
 لتشغيل البروكسي وتغيير الـ IP الخاص بك بالكامل للعبور من جدران الحماية، اتبع هذه الخطوات بعد حجز خادم VPS على **Google Cloud Platform (GCP)**:
 

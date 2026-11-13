@@ -1,7 +1,9 @@
 # Multi-stage build Dockerfile for FGXP (FigoX Protocol)
 
 # Stage 1: Build
-FROM golang:1.23-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 # Install build dependencies
 RUN apk add --no-cache git make
@@ -17,11 +19,11 @@ RUN go mod download
 COPY . .
 
 # Build binaries
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/bin/fgxp-server ./cmd/fgxp-server/main.go
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/bin/fgxp-client ./cmd/fgxp-client/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-w -s" -o /app/bin/fgxp-server ./cmd/fgxp-server
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-w -s" -o /app/bin/fgxp-client ./cmd/fgxp-client
 
 # Stage 2: Final minimal image
-FROM alpine:3.20
+FROM alpine:3.21
 
 # Install ca-certificates for TLS verification
 RUN apk add --no-cache ca-certificates
